@@ -1,3 +1,4 @@
+import {retryRead,type Control} from '../../core/control';
 import type {RequestUrlParam, RequestUrlResponse} from 'obsidian';
 import {hash,validPath,type Remote,type Entry} from '../../core/sync';
 export const HISTORY='.note-bridge-history';
@@ -9,15 +10,21 @@ function quote(s:string){return s.replaceAll('\\','\\\\').replaceAll("'","\\'");
 function buffer(bytes:Uint8Array):ArrayBuffer{return bytes.slice().buffer;}
 export class Drive implements Remote {
   folders=new Map<string,string>(); historyId='';
-  constructor(public root:string,private getToken:()=>Promise<string>,private transport:(params:RequestUrlParam)=>Promise<RequestUrlResponse>,private maxBytes=10*1024*1024) {
+  private cache=new Map<string,ArrayBuffer>(); private cachedBytes=0; scanned=0;
+  constructor(public root:string,private getToken:()=>Promise<string>,private transport:(params:RequestUrlParam)=>Promise<RequestUrlResponse>,private maxBytes=10*1024*1024,private control:Control={}) {
     if(!/^[\w-]+$/.test(root)||root==='root')throw new Error('Укажите ID отдельной папки Drive, не корень диска');
     this.folders.set('',root);
   }
   async req(params:RequestUrlParam):Promise<RequestUrlResponse> {
-    const response=await this.transport({...params,headers:{...params.headers,Authorization:'Bearer '+await this.getToken()},throw:false});
-    if(response.status>=400)throw new Error('Drive HTTP '+response.status+(response.status===412?' — файл изменился, повторите синк':''));
-    return response;
+    const execute=async()=>{
+      this.control.check?.();
+      const response=await this.transport({...params,headers:{...params.headers,Authorization:'Bearer '+await this.getToken()},throw:false});
+      if(response.status>=400)throw new Error('Drive HTTP '+response.status+(response.status===412?' — файл изменился, повторите синк':''));
+      return response;
+    };
+    return (!params.method||params.method==='GET')?retryRead(execute,()=>this.control.check?.()):execute();
   }
+
   async meta(id:string){return this.req({url:API+'/'+encodeURIComponent(id)+'?fields='+fields});}
   async children(id:string):Promise<FileMeta[]> {
     const found:FileMeta[]=[];let page='';
@@ -40,19 +47,32 @@ export class Drive implements Remote {
         if(!prefix&&f.name===HISTORY)continue;
         if(f.name.startsWith('.')||f.name==='Note Bridge Conflicts')continue;
         const path=prefix?prefix+'/'+f.name:f.name;
-        if(seen.has(f.name)||!validPath(path)||f.name.includes('/'))throw new Error('Дублирующийся или неподдерживаемый путь Drive: '+path);
+        if(seen.has(f.name))throw new Error('В Drive два объекта с одинаковым именем: '+JSON.stringify(path)+'. Уберите дубликат из синхронизируемой папки.');
+        if(!validPath(path)||f.name.includes('/'))throw new Error('Неподдерживаемое имя Drive: '+JSON.stringify(path)+'. Проверьте пробел/точку в конце, символы / \\ : * ? \" < > | и служебные имена. Кириллица разрешена.');
         seen.add(f.name);
         if(f.mimeType===FOLDER){this.folders.set(path,f.id);await walk(f.id,path,depth+1);continue;}
         if(f.mimeType.startsWith('application/vnd.google-apps.'))throw new Error('Используйте обычные файлы, не Google Docs/ярлыки: '+path);
         if(Number(f.size)>this.maxBytes)throw new Error('Файл больше лимита 10 МБ: '+path);
         const entry:Entry={path,id:f.id,version:f.version,hash:f.sha256Checksum||''};
-        if(!entry.hash)entry.hash=await hash(await this.download(entry));
+        if(!entry.hash){
+          const bytes=await this.download(entry);entry.hash=await hash(bytes);
+          if(this.cachedBytes+bytes.byteLength<=20*1024*1024){this.cache.set(entry.id!+'|'+entry.version,bytes);this.cachedBytes+=bytes.byteLength;}
+        }
+        this.control.progress?.({phase:'Сканирование Google Drive: найдено '+(++this.scanned),done:0,total:0,path});
         output.set(path,entry);
       }
     };
     await walk(this.root,'',0);return output;
   }
   async download(entry:Entry):Promise<ArrayBuffer> {
+    // A strong checksum from the listing proves the bytes match the planned revision.
+    // Keep version bracketing only for files without a checksum.
+    if(entry.hash){
+      const bytes=(await this.req({url:API+'/'+entry.id+'?alt=media'})).arrayBuffer;
+      if(bytes.byteLength>this.maxBytes)throw new Error('Файл превышает лимит');
+      if(await hash(bytes)!==entry.hash)throw new Error('Контрольная сумма Drive изменилась: '+entry.path);
+      return bytes;
+    }
     const before=(await this.meta(entry.id!)).json as FileMeta;
     if(before.version!==entry.version||before.trashed)throw new Error('Версия Drive изменилась: '+entry.path);
     if(Number(before.size)>this.maxBytes)throw new Error('Файл превышает лимит');
@@ -62,7 +82,7 @@ export class Drive implements Remote {
     if(after.version!==entry.version||after.trashed)throw new Error('Drive изменился во время чтения');
     return bytes;
   }
-  async read(entry:Entry){const bytes=await this.download(entry);if(entry.hash&&await hash(bytes)!==entry.hash)throw new Error('Контрольная сумма Drive изменилась');return bytes;}
+  async read(entry:Entry){const key=entry.id+'|'+entry.version;const cached=this.cache.get(key);if(cached){this.cache.delete(key);this.cachedBytes-=cached.byteLength;}const bytes=cached||await this.download(entry);if(entry.hash&&await hash(bytes)!==entry.hash)throw new Error('Контрольная сумма Drive изменилась');return bytes;}
   async folder(name:string,parent:string):Promise<string> {
     const matches=(await this.children(parent)).filter(f=>f.name===name);
     if(matches.length>1||matches.some(f=>f.mimeType!==FOLDER))throw new Error('Конфликт папки '+name);

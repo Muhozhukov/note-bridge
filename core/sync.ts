@@ -1,3 +1,4 @@
+import {type Control} from './control';
 export type Action = 'none' | 'upload' | 'download' | 'conflict' | 'local-deletion' | 'remote-deletion';
 /** Absence is not deletion unless a baseline exists. Never compare wall-clock dates. */
 export function decide(base: string | undefined, local: string | undefined, remote: string | undefined): Action {
@@ -35,7 +36,7 @@ export interface Remote {
 export class SyncEngine {
   running = false;
   constructor(private local: Local, private remote: Remote, public baseline: Baseline,
-    private checkpoint: (base: Baseline, event: Event)=>Promise<void>) {}
+    private checkpoint: (base: Baseline, event: Event)=>Promise<void>, private control:Control={}) {}
   async run(dryRun = false): Promise<Event[]> {
     if (this.running) throw new Error('Синхронизация уже выполняется');
     this.running = true;
@@ -46,19 +47,34 @@ export class SyncEngine {
     };
     try {
       // A failed/incomplete scan aborts before any writes. Metadata errors are not deletions.
-      const locals = await this.local.scan(); const remotes = await this.remote.scan();
+      this.control.check?.();
+      this.control.progress?.({phase:'Проверка локальных файлов',done:0,total:0});
+      const locals = await this.local.scan();
+      this.control.progress?.({phase:'Сканирование Google Drive',done:0,total:0});
+      const remotes = await this.remote.scan();
       const paths = [...new Set([...locals.keys(),...remotes.keys(),...Object.keys(this.baseline)])].sort();
       const fold = new Map<string,string>();
-      for (const path of paths) {
+      // Historical paths absent on both sides must not block a renamed folder.
+      for (const path of new Set([...locals.keys(),...remotes.keys()])) {
         if (!validPath(path)) throw new Error('Небезопасный или неподдерживаемый путь: '+path);
-        const k = path.normalize('NFC').toLowerCase();
-        if (fold.has(k) && fold.get(k)!==path) throw new Error('Конфликт регистра/Unicode: '+path);
-        fold.set(k,path);
+        let prefix='';
+        for(const part of path.split('/')){
+          prefix=prefix?prefix+'/'+part:part;
+          const k=prefix.normalize('NFC').toLowerCase();
+          if(fold.has(k)&&fold.get(k)!==prefix)throw new Error('Конфликт регистра/Unicode: '+JSON.stringify(fold.get(k))+' и '+JSON.stringify(prefix)+'. Согласуйте имена на телефоне и в Drive.');
+          fold.set(k,prefix);
+        }
       }
+      const total=paths.filter(p=>decide(this.baseline[p]?.hash,locals.get(p)?.hash,remotes.get(p)?.hash)!=='none').length;
+      let done=0;
+      this.control.progress?.({phase:'Синхронизация',done,total});
       for (const path of paths) {
+        this.control.check?.();
         const l=locals.get(path), r=remotes.get(path), b=this.baseline[path];
         const action=decide(b?.hash,l?.hash,r?.hash);
-        if (dryRun) { if(action!=='none') await emit(path,action); continue; }
+        if(action!=='none')this.control.progress?.({phase:dryRun?'Предпросмотр':'Синхронизация',done,total,path});
+        const advance=()=>this.control.progress?.({phase:'Синхронизация',done:++done,total,path});
+        if (dryRun) { if(action!=='none') await emit(path,action); if(action!=='none')advance(); continue; }
         if (action==='none') {
           if(l && r) this.baseline[path]={hash:l.hash,remoteId:r.id};
           else delete this.baseline[path];
@@ -66,7 +82,7 @@ export class SyncEngine {
         }
         if (action==='local-deletion'||action==='remote-deletion') {
           // Alpha deliberately requires manual review of deletions and renames.
-          await emit(path,action,'Удаление не распространено; требуется проверка.'); continue;
+          await emit(path,action,'Удаление не распространено; требуется проверка.'); advance(); continue;
         }
         if (action==='upload') {
           const bytes=await this.local.read(path);
@@ -78,20 +94,22 @@ export class SyncEngine {
         } else {
           const bytes=await this.remote.read(r!);
           if(await hash(bytes)!==r!.hash) throw new Error('Удалённый файл изменился: '+path);
-          await this.remote.snapshot(path,bytes,'remote');
           if(action==='conflict') {
+            await this.remote.snapshot(path,bytes,'remote-conflict');
             await this.remote.snapshot(path,await this.local.read(path),'local-conflict');
             await this.local.conflict(path,bytes,r!.hash);
             await emit(path,action,'Локальный оригинал сохранён; удалённая версия в Note Bridge Conflicts.');
-            continue; // Do not advance baseline until the user resolves the conflict.
+            advance(); continue; // Do not advance baseline until the user resolves the conflict.
           }
           if(l) await this.remote.snapshot(path,await this.local.read(path),'local-before-download');
           await this.local.write(path,bytes,l?.hash);
           this.baseline[path]={hash:r!.hash,remoteId:r!.id};
         }
-        await emit(path,action);
+        await emit(path,action); advance();
       }
+      this.control.check?.();
       if(!dryRun) await emit('', 'complete');
+      this.control.progress?.({phase:'Завершено',done:total,total});
       return events;
     } finally { this.running=false; }
   }

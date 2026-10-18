@@ -1,1 +1,9 @@
-{"id":"note-bridge","name":"Note Bridge","version":"0.1.0","minAppVersion":"1.11.4","description":"Synchronize a local vault with Google Drive using conservative conflict handling.","author":"Note Bridge contributors","isDesktopOnly":false}
+{
+  "id": "note-bridge",
+  "name": "Note Bridge",
+  "version": "0.1.1",
+  "minAppVersion": "1.11.4",
+  "description": "Synchronize a local vault with Google Drive using conservative conflict handling.",
+  "author": "Note Bridge contributors",
+  "isDesktopOnly": false
+}

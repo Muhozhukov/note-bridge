@@ -31,3 +31,25 @@ test('local edit during download is preserved',async()=>{const l=new Memory({'a.
 test('dry run leaves baseline, files and history untouched',async()=>{const l=new Memory({'a.md':'new'}),r=new Memory({'a.md':'old'});const b=await base('old');const original=JSON.stringify(b);let checkpoints=0;const e=new SyncEngine(local(l),r,b,async()=>{checkpoints++;});assert.equal((await e.run(true))[0].action,'upload');assert.equal(checkpoints,0);assert.equal(r.backups.length,0);assert.equal(JSON.stringify(b),original);});
 test('case collision stops entire run before writes',async()=>{const l=new Memory({'Note.md':'a'}),r=new Memory({'note.md':'b'});await assert.rejects(new SyncEngine(local(l),r,{},async()=>{}).run(),/регистр/);assert.equal(r.backups.length,0);});
 test('deletions remain pending and do not resurrect files',async()=>{const l=new Memory({}),r=new Memory({'a.md':'old'});const e=new SyncEngine(local(l),r,await base('old'),async()=>{});const events=await e.run();assert.equal(events[0].action,'local-deletion');assert.equal(l.files.size,0);assert.equal(r.files.size,1);});
+test('stale baseline case does not block new active path',async()=>{
+ const l=new Memory({}),r=new Memory({'ремонт квартиры/План.md':'new'});
+ const b:Baseline={'Ремонт квартиры/План.md':{hash:'old'}};
+ await new SyncEngine(local(l),r,b,async()=>{}).run();
+ assert.equal(l.files.size,1);assert.equal(b['Ремонт квартиры/План.md'],undefined);
+});
+test('case collision in ancestor directories fails before writes',async()=>{
+ const l=new Memory({'Ремонт/a.md':'a'}),r=new Memory({'ремонт/b.md':'b'});
+ await assert.rejects(new SyncEngine(local(l),r,{},async()=>{}).run(),/регистр/);assert.equal(l.files.size,1);assert.equal(r.files.size,1);
+});
+test('first import creates no redundant Drive snapshots and reports progress',async()=>{
+ const l=new Memory({}),r=new Memory({'a.md':'one','b.md':'two'});const progress: {done:number;total:number}[]=[];
+ await new SyncEngine(local(l),r,{},async()=>{},{progress:p=>progress.push(p)}).run();
+ assert.equal(r.backups.length,0);assert.ok(progress.some(p=>p.done===1&&p.total===2));assert.equal(progress.at(-1)?.done,2);
+});
+test('pause preserves checkpoints and resume skips downloaded files',async()=>{
+ const l=new Memory({}),r=new Memory({'a.md':'one','b.md':'two'});const b:Baseline={};let paused=false;
+ const {Paused}=await import('../core/control');
+ await assert.rejects(new SyncEngine(local(l),r,b,async()=>{paused=true;},{check:()=>{if(paused)throw new Paused();}}).run(),Paused);
+ assert.equal(l.files.size,1);assert.ok(b['a.md']);let downloads=0;const write=l.write.bind(l);l.write=async(...args)=>{downloads++;return write(...args);};
+ await new SyncEngine(local(l),r,b,async()=>{}).run();assert.equal(downloads,1);assert.equal(l.files.size,2);
+});

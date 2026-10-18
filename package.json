@@ -1,1 +1,22 @@
-{"name":"note-bridge","version":"0.1.0","private":true,"type":"module","scripts":{"build":"node scripts/build.mjs","test":"node --import tsx --test tests/*.test.ts","typecheck":"tsc --noEmit","check":"npm run typecheck && npm test && npm run build","worker:types":"wrangler types --config auth-service/wrangler.jsonc"},"devDependencies":{"@cloudflare/workers-types":"latest","@types/node":"^24.0.0","esbuild":"^0.28.2","obsidian":"latest","tsx":"^4.20.0","typescript":"^5.9.0","wrangler":"latest"}}
+{
+  "name": "note-bridge",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test && npm run build",
+    "worker:types": "wrangler types --config auth-service/wrangler.jsonc"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "latest",
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.28.2",
+    "obsidian": "latest",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "wrangler": "latest"
+  }
+}
