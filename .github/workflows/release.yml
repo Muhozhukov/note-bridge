@@ -1,0 +1,22 @@
+name: Build experimental release
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - name: Publish experimental assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(node -p "require('./manifest.json').version")
+          gh release create "$VERSION" dist/note-bridge/main.js dist/note-bridge/manifest.json dist/note-bridge/styles.css --prerelease --title "Note Bridge $VERSION — experimental" --notes-file docs/STATUS.md

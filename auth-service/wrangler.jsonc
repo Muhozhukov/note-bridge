@@ -1,0 +1,28 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "note-bridge-auth",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-18",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "workers_dev": true,
+  "observability": {
+    "enabled": false
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "note-bridge-auth",
+      "database_id": "660bc474-55ec-491e-b8a6-a253d08ded45"
+    }
+  ],
+  "vars": {
+    "PUBLIC_ORIGIN": "https://note-bridge-auth.pravoepredserdie.workers.dev"
+  },
+  "triggers": {
+    "crons": [
+      "15 * * * *"
+    ]
+  }
+}

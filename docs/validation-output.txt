@@ -1,0 +1,69 @@
+npm warn Unknown env config "http-proxy". This will stop working in the next major version of npm.
+
+> note-bridge@0.1.0 check
+> npm run typecheck && npm test && npm run build
+
+npm warn Unknown env config "http-proxy". This will stop working in the next major version of npm.
+
+> note-bridge@0.1.0 typecheck
+> tsc --noEmit
+
+npm warn Unknown env config "http-proxy". This will stop working in the next major version of npm.
+
+> note-bridge@0.1.0 test
+> node --import tsx --test tests/*.test.ts
+
+✔ authenticated encryption rejects tampering and wrong key (11.530359ms)
+✔ constant time helper verifies equality (2.295124ms)
+✔ unconfigured service fails closed (4.862894ms)
+✔ pairing and input guards (5.073029ms)
+✔ authorization URL carries PKCE/state and secure browser binding (4.288713ms)
+✔ claim requires device verifier and grants exactly once (4.653701ms)
+✔ expired session cannot be redeemed (1.564747ms)
+✔ Google callback, encrypted persistence and device token refresh (4.989956ms)
+✔ wrong Google account is denied and session destroyed (2.191892ms)
+✔ paginated listings must read every page (1.606087ms)
+✔ incomplete Drive listing fails closed (3.652565ms)
+✔ conditional upload includes exact etag and verifies downloaded content (12.769871ms)
+✔ no ETag means no overwrite (0.321163ms)
+✔ precondition failure is surfaced, not retried as blind write (0.255046ms)
+✔ decision undefined/undefined/r (1.251745ms)
+✔ decision undefined/l/undefined (0.12184ms)
+✔ decision undefined/l/r (0.079817ms)
+✔ decision a/a/a (0.062522ms)
+✔ decision a/b/a (0.064114ms)
+✔ decision a/a/b (0.063984ms)
+✔ decision a/b/b (0.336717ms)
+✔ decision a/b/c (0.066639ms)
+✔ decision a/undefined/a (0.065496ms)
+✔ decision a/a/undefined (0.14256ms)
+✔ decision a/undefined/b (0.086547ms)
+✔ decision a/b/undefined (0.06095ms)
+✔ decision a/undefined/undefined (0.080438ms)
+✔ reject path ../secret (0.117873ms)
+✔ reject path .obsidian/data.json (0.073458ms)
+✔ reject path a/../../b (0.137312ms)
+✔ reject path a\b (0.063193ms)
+✔ reject path CON.md (0.089903ms)
+✔ reject path a//b (0.036814ms)
+✔ reject path a/ (0.032778ms)
+✔ reject path a:b (0.031837ms)
+✔ reject path a. (0.033169ms)
+✔ reject path Note Bridge Conflicts/a.md (0.258912ms)
+✔ Unicode and spaces accepted (0.23009ms)
+✔ first empty device downloads rather than deletes (13.168804ms)
+✔ offline edits conflict; both originals preserved; repeated sync deduplicates copy (1.357561ms)
+✔ network failure cannot trigger writes or deletions (0.596259ms)
+✔ remote concurrent edit rejects upload after snapshots (1.096797ms)
+✔ local edit during download is preserved (0.732831ms)
+✔ dry run leaves baseline, files and history untouched (0.439868ms)
+✔ case collision stops entire run before writes (0.618532ms)
+✔ deletions remain pending and do not resurrect files (0.392188ms)
+ℹ tests 46
+ℹ suites 0
+ℹ pass 46
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 271.238682
