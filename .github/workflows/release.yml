@@ -1,6 +1,14 @@
 name: Build experimental release
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - manifest.json
+      - .github/workflows/release.yml
+concurrency:
+  group: experimental-release
+  cancel-in-progress: false
 permissions:
   contents: write
 jobs:
@@ -19,4 +27,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION=$(node -p "require('./manifest.json').version")
-          gh release create "$VERSION" dist/note-bridge/main.js dist/note-bridge/manifest.json dist/note-bridge/styles.css --prerelease --title "Note Bridge $VERSION — experimental" --notes-file docs/STATUS.md
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists; leaving its assets unchanged."
+            exit 0
+          fi
+          gh release create "$VERSION" dist/note-bridge/main.js dist/note-bridge/manifest.json dist/note-bridge/styles.css --target "$GITHUB_SHA" --prerelease --title "Note Bridge $VERSION — experimental" --notes-file docs/STATUS.md
