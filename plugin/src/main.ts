@@ -1,5 +1,5 @@
 import {Paused,type Progress} from '../../core/control';
-import {Plugin,PluginSettingTab,Setting,Notice,Modal,TFile,requestUrl, Platform,type App} from 'obsidian';
+import {Plugin,PluginSettingTab,Setting,Notice,Modal,TFile,requestUrl,setIcon,type App} from 'obsidian';
 import {SyncEngine,hash,validPath,type Baseline,type Event,type Local,type Entry} from '../../core/sync';
 import {Drive} from './drive';
 import {random,digest} from '../../auth-service/src/crypto';
@@ -9,7 +9,7 @@ const defaults:Settings={workerUrl:'https://note-bridge-auth.pravoepredserdie.wo
 class HistoryModal extends Modal {
   constructor(app:App,private events:Event[]){super(app);}
   onOpen(){this.titleEl.setText('Note Bridge — журнал');this.contentEl.createEl('p',{text:'Журнал этого устройства. Снимки файлов сохраняются в служебной папке .note-bridge-history в Google Drive. Автоматический откат пока не реализован.'});
-    new Setting(this.contentEl).addButton(b=>b.setButtonText('Скопировать журнал').onClick(()=>{void navigator.clipboard.writeText(JSON.stringify({version:'0.1.2',events:this.events},null,2)).then(()=>new Notice('Журнал скопирован')).catch(()=>new Notice('Копирование недоступно; используйте экспорт из настроек.'));}));
+    new Setting(this.contentEl).addButton(b=>b.setButtonText('Скопировать журнал').onClick(()=>{void navigator.clipboard.writeText(JSON.stringify({version:'0.1.3',events:this.events},null,2)).then(()=>new Notice('Журнал скопирован')).catch(()=>new Notice('Копирование недоступно; используйте экспорт из настроек.'));}));
     for(const e of this.events.slice(-100).reverse())this.contentEl.createEl('p',{text:`${e.time} · ${e.action} · ${e.path}${e.detail?' — '+e.detail:''}`});}
 }
 class ProgressModal extends Modal {
@@ -31,7 +31,7 @@ class ProgressModal extends Modal {
 export default class NoteBridge extends Plugin {
   state:Saved={settings:{...defaults},baseline:{},events:[]};
   status!:HTMLElement; busy=false; stopped=false; timer:number|undefined; saveQueue:Promise<void>=Promise.resolve();
-  progress:Progress={phase:'Готов',done:0,total:0}; listeners=new Set<()=>void>(); paused=false; backgrounded=false; mobileButton?:HTMLButtonElement; mobileProgress?:HTMLProgressElement;
+  progress:Progress={phase:'Готов',done:0,total:0}; listeners=new Set<()=>void>(); paused=false; backgrounded=false; explorerButtons=new Set<HTMLElement>();
   tokenRequest?:Promise<string>;
   access?:{token:string;expires:number}; pending?:{session:string;verifier:string};
   async onload(){
@@ -41,12 +41,15 @@ export default class NoteBridge extends Plugin {
     await this.persist();
     this.status=this.addStatusBarItem();this.status.setText('Note Bridge: готов');
     this.addRibbonIcon('refresh-cw','Note Bridge: синхронизация и прогресс',()=>this.openProgress());
-    if(Platform.isMobile){
-      const panel=document.body.createDiv({cls:'nb-mobile'});
-      this.mobileButton=panel.createEl('button',{text:'↻ Синхронизировать',attr:{'aria-label':'Note Bridge: синхронизация и прогресс'}});
-      this.mobileProgress=panel.createEl('progress');this.mobileProgress.max=1;this.mobileProgress.value=0;
-      this.registerDomEvent(this.mobileButton,'click',()=>this.openProgress());this.register(()=>panel.remove());
-    }
+    const mount=()=>this.mountExplorerButtons();
+    this.app.workspace.onLayoutReady(()=>{
+      mount();
+      const observer=new MutationObserver(mount);
+      observer.observe(this.app.workspace.containerEl,{childList:true,subtree:true});
+      this.register(()=>observer.disconnect());
+    });
+    this.registerEvent(this.app.workspace.on('layout-change',mount));
+    this.register(()=>{this.explorerButtons.forEach(b=>b.remove());this.explorerButtons.clear();});
     this.addCommand({id:'progress',name:'Синхронизация и прогресс',callback:()=>this.openProgress()});
     this.addCommand({id:'sync',name:'Синхронизировать',callback:()=>{void this.sync();}});
     this.addCommand({id:'preview',name:'Предпросмотр синхронизации',callback:()=>{void this.sync(true);}});
@@ -62,10 +65,27 @@ export default class NoteBridge extends Plugin {
     this.app.workspace.onLayoutReady(()=>{if(this.state.resumeSync&&!document.hidden)void this.sync();else schedule();});
   }
   onunload(){this.stopped=true;if(this.timer)window.clearTimeout(this.timer);this.access=undefined;this.pending=undefined;}
+  mountExplorerButtons(){
+    if(this.stopped)return;
+    for(const button of this.explorerButtons)if(!button.isConnected)this.explorerButtons.delete(button);
+    // File explorer has no public toolbar extension API. Keep this integration scoped
+    // to its own toolbar; ribbon and commands remain available if the DOM changes.
+    for(const leaf of this.app.workspace.getLeavesOfType('file-explorer')){
+      const toolbar=leaf.view.containerEl.querySelector<HTMLElement>('.nav-buttons-container');
+      if(!toolbar||toolbar.querySelector('.nb-explorer-sync'))continue;
+      const button=toolbar.createDiv({cls:'nav-action-button clickable-icon nb-explorer-sync',attr:{role:'button',tabindex:'0','aria-label':'Note Bridge: синхронизировать'}});
+      setIcon(button,'refresh-cw');
+      const activate=()=>this.openProgress();button.onclick=activate;
+      button.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();activate();}};
+      this.explorerButtons.add(button);
+    }
+  }
   setProgress(p:Progress){
     this.progress=p;this.status?.setText('Note Bridge: '+p.phase+(p.total?` ${p.done}/${p.total}`:''));
-    if(this.mobileButton)this.mobileButton.setText(this.busy?(p.total?`↻ ${p.done}/${p.total}`:'↻ Сверка…'):'↻ Синхронизировать');
-    if(this.mobileProgress){this.mobileProgress.max=Math.max(1,p.total);this.mobileProgress.value=p.done;if(this.busy&&!p.total)this.mobileProgress.removeAttribute('value');}
+    for(const button of this.explorerButtons){
+      button.setAttribute('aria-label','Note Bridge: '+p.phase+(p.total?` ${p.done}/${p.total}`:''));
+      button.classList.toggle('nb-sync-active',this.busy);
+    }
     this.listeners.forEach(fn=>fn());
   }
   openProgress(){new ProgressModal(this.app,this).open();if(!this.busy)void this.sync();}
@@ -169,7 +189,7 @@ export default class NoteBridge extends Plugin {
 class BridgeSettings extends PluginSettingTab {
   constructor(app:App,private p:NoteBridge){super(app,p);}
   display(){
-    const el=this.containerEl;el.empty();el.createEl('h2',{text:'Note Bridge · тестовая версия 0.1.2'});
+    const el=this.containerEl;el.empty();el.createEl('h2',{text:'Note Bridge · тестовая версия 0.1.3'});
     el.createEl('p',{text:'Используйте отдельную копию хранилища. Автоудаление и переименование пока не распространяются. Лимит файла — 10 МБ. Другие средства синхронизации этого хранилища должны быть отключены.'});
     new Setting(el).setName('Адрес сервиса авторизации').setDesc('https://имя.workers.dev').addText(t=>t.setValue(this.p.state.settings.workerUrl).onChange(async v=>{if(this.p.busy)return;this.p.state.settings.workerUrl=v.trim();this.p.access=undefined;await this.p.persist();}));
     new Setting(el).setName('ID папки Google Drive').setDesc('Часть адреса после /folders/. Папку создайте заранее.').addText(t=>t.setValue(this.p.state.settings.folderId).onChange(async v=>{if(this.p.busy)return;this.p.state.settings.folderId=v.trim();await this.p.persist();}));
