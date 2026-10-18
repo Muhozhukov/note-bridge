@@ -31,3 +31,11 @@ test('hashless scan caches verified bytes instead of downloading twice',async()=
  });
  const scan=await d.scan();await d.read(scan.get('Ремонт квартиры.md')!);assert.equal(media,1);
 });
+test('folder rename patches title with ETag and never uploads contents',async()=>{
+ const calls:RequestUrlParam[]=[];const d=new Drive('root-folder',async()=>'token',async p=>{calls.push(p);if(p.url.includes('pageSize'))return response({files:[]});if(p.method==='PATCH')return response({id:'old-id',version:'2'});return response({id:'old-id',version:'1',etag:'"v1"'});});
+ d.folderMeta.set('old',{id:'old-id',name:'old',mimeType:'application/vnd.google-apps.folder',version:'1'});d.folders.set('old','old-id');
+ await d.rename('old','new',true,new Map(),'old-id');const patch=calls.find(p=>p.method==='PATCH')!;assert.deepEqual(JSON.parse(patch.body as string),{title:'new'});assert.equal(patch.headers?.['If-Match'],'"v1"');assert.equal(calls.some(p=>p.url.includes('/upload/')),false);
+});
+test('trash rejects changed revision without deleting',async()=>{let writes=0;const d=new Drive('folder',async()=>'token',async p=>{if(p.method==='PATCH')writes++;return response({version:'2',etag:'"2"'});});await assert.rejects(d.trash({id:'id',version:'1',path:'a.md',hash:'x'}),/изменился/);assert.equal(writes,0);});
+test('concurrent writes share folder creation',async()=>{let creates=0;let created=false;const d=new Drive('folder',async()=>'token',async p=>{if(p.method==='POST'){creates++;created=true;return response({id:'child'});}await new Promise(r=>setTimeout(r,1));return response({files:created?[{id:'child',name:'same',mimeType:'application/vnd.google-apps.folder'}]:[]});});assert.deepEqual(await Promise.all([d.folder('same','folder'),d.folder('same','folder'),d.folder('same','folder')]),['child','child','child']);assert.equal(creates,1);});
+test('lost rename response can be recovered by target identity',async()=>{const d=new Drive('folder',async()=>'token',async()=>{throw new Error('No request needed');});d.folderMeta.set('new',{id:'same',name:'new',mimeType:'application/vnd.google-apps.folder',version:'2'});await d.rename('old','new',true,new Map(),'same');await assert.rejects(d.rename('old','new',true,new Map(),'other'),/не найден/);});

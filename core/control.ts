@@ -12,3 +12,9 @@ export async function retryRead<T>(operation:()=>Promise<T>,check:()=>void=()=>{
     }
   }
 }
+/** Stop scheduling after first failure, but drain active work before releasing the lock. */
+export async function pool<T>(items:T[],work:(item:T)=>Promise<void>,limit=3){
+ let next=0,failed=false,error:unknown;
+ const worker=async()=>{while(!failed&&next<items.length){const item=items[next++];try{await work(item);}catch(e){if(!failed){failed=true;error=e;}}}};
+ await Promise.all(Array.from({length:Math.min(limit,items.length)},worker));if(failed)throw error;
+}

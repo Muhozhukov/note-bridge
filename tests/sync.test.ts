@@ -47,9 +47,22 @@ test('first import creates no redundant Drive snapshots and reports progress',as
  assert.equal(r.backups.length,0);assert.ok(progress.some(p=>p.done===1&&p.total===2));assert.equal(progress.at(-1)?.done,2);
 });
 test('pause preserves checkpoints and resume skips downloaded files',async()=>{
- const l=new Memory({}),r=new Memory({'a.md':'one','b.md':'two'});const b:Baseline={};let paused=false;
+ const l=new Memory({}),r=new Memory({'a.md':'one','b.md':'two','c.md':'three','d.md':'four','e.md':'five'});const b:Baseline={};let paused=false;
  const {Paused}=await import('../core/control');
  await assert.rejects(new SyncEngine(local(l),r,b,async()=>{paused=true;},{check:()=>{if(paused)throw new Paused();}}).run(),Paused);
- assert.equal(l.files.size,1);assert.ok(b['a.md']);let downloads=0;const write=l.write.bind(l);l.write=async(...args)=>{downloads++;return write(...args);};
- await new SyncEngine(local(l),r,b,async()=>{}).run();assert.equal(downloads,1);assert.equal(l.files.size,2);
+ const finished=l.files.size;assert.ok(finished>=1&&finished<=3);assert.equal(Object.keys(b).length,finished);let downloads=0;const write=l.write.bind(l);l.write=async(...args)=>{downloads++;return write(...args);};
+ await new SyncEngine(local(l),r,b,async()=>{}).run();assert.equal(downloads,5-finished);assert.equal(l.files.size,5);
 });
+test('remote rename follows stable ID locally without reupload',async()=>{
+ const l=new Memory({'old/a.md':'same'}),r=new Memory({'new/a.md':'same'});const b:Baseline={'old/a.md':{hash:await hash(bytes('same')),remoteId:'stable'}};
+ const remote:Remote={scan:async()=>new Map([['new/a.md',{path:'new/a.md',id:'stable',hash:await hash(bytes('same'))}]]),read:e=>r.read(e),write:async()=>{throw new Error('Unexpected upload');},snapshot:async()=>{throw new Error('Unexpected snapshot');}};
+ const adapter=local(l);adapter.move=async(from,to,expected)=>{assert.equal(await hash(l.files.get(from)!),expected);l.files.set(to,l.files.get(from)!);l.files.delete(from);};
+ await new SyncEngine(adapter,remote,b,async()=>{}).run();assert.equal(l.files.has('old/a.md'),false);assert.equal(l.files.has('new/a.md'),true);assert.equal(b['new/a.md'].remoteId,'stable');
+});
+test('remote rename with local edits fails without moving or uploading',async()=>{
+ const l=new Memory({'old.md':'edited'}),r=new Memory({'new.md':'old'});const b:Baseline={'old.md':{hash:await hash(bytes('old')),remoteId:'stable'}};
+ r.scan=async()=>new Map([['new.md',{path:'new.md',id:'stable',hash:await hash(bytes('old'))}]]);
+ const adapter=local(l);let moved=false;adapter.move=async()=>{moved=true;};
+ await assert.rejects(new SyncEngine(adapter,r,b,async()=>{}).run(),/конфликтует/);assert.equal(moved,false);assert.equal(l.files.has('old.md'),true);
+});
+test('first upload creates no redundant history snapshot',async()=>{const l=new Memory({'a.md':'new'}),r=new Memory({});await new SyncEngine(local(l),r,{},async()=>{}).run();assert.equal(r.backups.length,0);assert.equal(r.files.size,1);});

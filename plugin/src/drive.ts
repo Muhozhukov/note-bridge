@@ -10,6 +10,8 @@ function quote(s:string){return s.replaceAll('\\','\\\\').replaceAll("'","\\'");
 function buffer(bytes:Uint8Array):ArrayBuffer{return bytes.slice().buffer;}
 export class Drive implements Remote {
   folders=new Map<string,string>(); historyId='';
+  folderMeta=new Map<string,FileMeta>();
+  private folderRequests=new Map<string,Promise<string>>();
   private cache=new Map<string,ArrayBuffer>(); private cachedBytes=0; scanned=0;
   constructor(public root:string,private getToken:()=>Promise<string>,private transport:(params:RequestUrlParam)=>Promise<RequestUrlResponse>,private maxBytes=10*1024*1024,private control:Control={}) {
     if(!/^[\w-]+$/.test(root)||root==='root')throw new Error('Укажите ID отдельной папки Drive, не корень диска');
@@ -39,7 +41,7 @@ export class Drive implements Remote {
   async scan():Promise<Map<string,Entry>> {
     const root=(await this.meta(this.root)).json as FileMeta;
     if(root.mimeType!==FOLDER||root.trashed)throw new Error('Выбранная папка недоступна');
-    const output=new Map<string,Entry>();this.folders=new Map([['',this.root]]);
+    const output=new Map<string,Entry>();this.folders=new Map([['',this.root]]);this.folderMeta.clear();this.scanned=0;
     const walk=async(id:string,prefix:string,depth:number)=>{
       if(depth>30)throw new Error('Слишком большая глубина папок');
       const seen=new Set<string>();
@@ -50,7 +52,7 @@ export class Drive implements Remote {
         if(seen.has(f.name))throw new Error('В Drive два объекта с одинаковым именем: '+JSON.stringify(path)+'. Уберите дубликат из синхронизируемой папки.');
         if(!validPath(path)||f.name.includes('/'))throw new Error('Неподдерживаемое имя Drive: '+JSON.stringify(path)+'. Проверьте пробел/точку в конце, символы / \\ : * ? \" < > | и служебные имена. Кириллица разрешена.');
         seen.add(f.name);
-        if(f.mimeType===FOLDER){this.folders.set(path,f.id);await walk(f.id,path,depth+1);continue;}
+        if(f.mimeType===FOLDER){this.folders.set(path,f.id);this.folderMeta.set(path,f);await walk(f.id,path,depth+1);continue;}
         if(f.mimeType.startsWith('application/vnd.google-apps.'))throw new Error('Используйте обычные файлы, не Google Docs/ярлыки: '+path);
         if(Number(f.size)>this.maxBytes)throw new Error('Файл больше лимита 10 МБ: '+path);
         const entry:Entry={path,id:f.id,version:f.version,hash:f.sha256Checksum||''};
@@ -83,7 +85,12 @@ export class Drive implements Remote {
     return bytes;
   }
   async read(entry:Entry){const key=entry.id+'|'+entry.version;const cached=this.cache.get(key);if(cached){this.cache.delete(key);this.cachedBytes-=cached.byteLength;}const bytes=cached||await this.download(entry);if(entry.hash&&await hash(bytes)!==entry.hash)throw new Error('Контрольная сумма Drive изменилась');return bytes;}
-  async folder(name:string,parent:string):Promise<string> {
+  async folder(name:string,parent:string):Promise<string>{
+    const key=parent+'/'+name;const pending=this.folderRequests.get(key);if(pending)return pending;
+    const request=this.ensureFolder(name,parent);this.folderRequests.set(key,request);
+    try{return await request;}finally{this.folderRequests.delete(key);}
+  }
+  private async ensureFolder(name:string,parent:string):Promise<string> {
     const matches=(await this.children(parent)).filter(f=>f.name===name);
     if(matches.length>1||matches.some(f=>f.mimeType!==FOLDER))throw new Error('Конфликт папки '+name);
     if(matches[0])return matches[0].id;
@@ -123,7 +130,34 @@ export class Drive implements Remote {
       if((await this.children(parent)).filter(f=>f.name===name).length!==1)throw new Error('Одновременное создание файла; обе копии сохранены в Drive');
     }
     const entry={path,id:result.id,version:result.version,hash:await hash(bytes)};
-    const saved=await this.read(entry);if(await hash(saved)!==entry.hash)throw new Error('Проверка записи не пройдена');return entry;
+    if(result.sha256Checksum){if(result.sha256Checksum!==entry.hash)throw new Error('Проверка записи не пройдена');}
+    else {const saved=await this.read(entry);if(await hash(saved)!==entry.hash)throw new Error('Проверка записи не пройдена');}
+    return entry;
+  }
+  async patchChecked(id:string,version:string,body:Record<string,unknown>,query=''){
+    const meta=(await this.req({url:'https://www.googleapis.com/drive/v2/files/'+id+'?fields=id,etag,version,labels(trashed)'})).json;
+    if(meta.version!==version||meta.labels?.trashed||!meta.etag)throw new Error('Drive изменился; обновите список конфликтов');
+    return this.req({url:'https://www.googleapis.com/drive/v2/files/'+id+'?fields=id,version'+query,method:'PATCH',headers:{'If-Match':meta.etag},contentType:'application/json',body:JSON.stringify(body)});
+  }
+  async rename(from:string,to:string,folder:boolean,files:Map<string,Entry>,expectedId?:string){
+    if(!validPath(from)||!validPath(to)||to.startsWith(from+'/'))throw new Error('Недопустимое переименование');
+    const source=folder?this.folderMeta.get(from):files.get(from);
+    // Recover a completed rename whose response/checkpoint was lost.
+    const target=folder?this.folderMeta.get(to):files.get(to);
+    if(!source){if(target?.id===expectedId&&expectedId)return;throw new Error('Исходный путь Drive не найден: '+from);}
+    if(expectedId&&source.id!==expectedId)throw new Error('Исходный объект Drive был заменён');
+    if(target)throw new Error('Новый путь уже занят в Drive: '+to+'. Откройте «Конфликты и удаления».');
+    const parent=await this.parent(to),oldParent=this.folders.get(from.split('/').slice(0,-1).join('/'))!;
+    const matches=(await this.children(parent)).filter(f=>f.name===to.split('/').at(-1)&&f.id!==source.id);
+    if(matches.length)throw new Error('Новое имя уже занято в Drive: '+to);
+    await this.patchChecked(source.id!,source.version!,{title:to.split('/').at(-1)},parent===oldParent?'':'&addParents='+encodeURIComponent(parent)+'&removeParents='+encodeURIComponent(oldParent));
+  }
+  async trash(entry:Entry){if(!entry.id||!entry.version)throw new Error('Нет версии для безопасного удаления');await this.patchChecked(entry.id,entry.version,{labels:{trashed:true}});}
+  /** Check every descendant, including unsupported/hidden files, before trashing a folder. */
+  async treeStamp(id:string):Promise<string>{
+    const rows:string[]=[];
+    const walk=async(parent:string,depth:number)=>{if(depth>30)throw new Error('Слишком большая глубина');for(const f of await this.children(parent)){if(f.name.startsWith('.')||f.name==='Note Bridge Conflicts')throw new Error('В папке есть служебные файлы; проверьте её вручную');rows.push(JSON.stringify([f.id,f.name,f.version,f.mimeType]));if(f.mimeType===FOLDER)await walk(f.id,depth+1);else if(f.name.startsWith('.')||f.mimeType.startsWith('application/vnd.google-apps.'))throw new Error('В папке есть служебные/неподдерживаемые файлы; удалите её вручную после проверки');}};
+    await walk(id,0);return rows.sort().join('\n');
   }
   async snapshot(path:string,bytes:ArrayBuffer,source:string):Promise<void>{
     if(!this.historyId)this.historyId=await this.folder(HISTORY,this.root);
