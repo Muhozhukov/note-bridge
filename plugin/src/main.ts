@@ -9,7 +9,7 @@ const defaults:Settings={workerUrl:'https://note-bridge-auth.pravoepredserdie.wo
 class HistoryModal extends Modal {
   constructor(app:App,private events:Event[]){super(app);}
   onOpen(){this.titleEl.setText('Note Bridge — журнал');this.contentEl.createEl('p',{text:'Журнал этого устройства. Снимки файлов сохраняются в служебной папке .note-bridge-history в Google Drive. Автоматический откат пока не реализован.'});
-    new Setting(this.contentEl).addButton(b=>b.setButtonText('Скопировать журнал').onClick(()=>{void navigator.clipboard.writeText(JSON.stringify({version:'0.1.1',events:this.events},null,2)).then(()=>new Notice('Журнал скопирован')).catch(()=>new Notice('Копирование недоступно; используйте экспорт из настроек.'));}));
+    new Setting(this.contentEl).addButton(b=>b.setButtonText('Скопировать журнал').onClick(()=>{void navigator.clipboard.writeText(JSON.stringify({version:'0.1.2',events:this.events},null,2)).then(()=>new Notice('Журнал скопирован')).catch(()=>new Notice('Копирование недоступно; используйте экспорт из настроек.'));}));
     for(const e of this.events.slice(-100).reverse())this.contentEl.createEl('p',{text:`${e.time} · ${e.action} · ${e.path}${e.detail?' — '+e.detail:''}`});}
 }
 class ProgressModal extends Modal {
@@ -31,7 +31,7 @@ class ProgressModal extends Modal {
 export default class NoteBridge extends Plugin {
   state:Saved={settings:{...defaults},baseline:{},events:[]};
   status!:HTMLElement; busy=false; stopped=false; timer:number|undefined; saveQueue:Promise<void>=Promise.resolve();
-  progress:Progress={phase:'Готов',done:0,total:0}; listeners=new Set<()=>void>(); paused=false; mobileButton?:HTMLButtonElement; mobileProgress?:HTMLProgressElement;
+  progress:Progress={phase:'Готов',done:0,total:0}; listeners=new Set<()=>void>(); paused=false; backgrounded=false; mobileButton?:HTMLButtonElement; mobileProgress?:HTMLProgressElement;
   tokenRequest?:Promise<string>;
   access?:{token:string;expires:number}; pending?:{session:string;verifier:string};
   async onload(){
@@ -55,7 +55,7 @@ export default class NoteBridge extends Plugin {
     const schedule=()=>{if(!this.state.settings.autoSync||this.busy||this.stopped||this.paused)return;if(this.timer)window.clearTimeout(this.timer);this.timer=window.setTimeout(()=>{void this.sync();},5000);};
     this.registerEvent(this.app.vault.on('modify',schedule));this.registerEvent(this.app.vault.on('create',schedule));this.registerEvent(this.app.vault.on('delete',schedule));this.registerEvent(this.app.vault.on('rename',schedule));
     this.registerDomEvent(document,'visibilitychange',()=>{
-      if(document.hidden&&this.busy){this.setProgress({...this.progress,phase:'Пауза: Obsidian в фоне'});}
+      if(document.hidden&&this.busy){this.backgrounded=true;this.setProgress({...this.progress,phase:'Пауза: Obsidian в фоне'});}
       if(!document.hidden){if(this.state.resumeSync&&!this.busy&&!this.paused)void this.sync();else schedule();}
     });
     let last=0;this.registerInterval(window.setInterval(()=>{if(Date.now()-last>=Math.max(60,this.state.settings.intervalSeconds)*1000){last=Date.now();if(!document.hidden)schedule();}},15000));
@@ -70,7 +70,7 @@ export default class NoteBridge extends Plugin {
   }
   openProgress(){new ProgressModal(this.app,this).open();if(!this.busy)void this.sync();}
   pause(){this.paused=true;this.state.resumeSync=false;void this.persist();this.setProgress({...this.progress,phase:'Пауза после текущей операции'});}
-  check(){if(this.stopped||this.paused||document.hidden)throw new Paused();}
+  check(){if(this.stopped||this.paused||this.backgrounded||document.hidden)throw new Paused();}
   async exportJournal(){
     const path='Note Bridge Journal '+new Date().toISOString().replace(/[:.]/g,'-')+'.json';
     await this.app.vault.create(path,JSON.stringify({version:this.manifest.version,events:this.state.events},null,2));new Notice('Создан '+path);
@@ -139,7 +139,7 @@ export default class NoteBridge extends Plugin {
     };
   }
   async sync(dryRun=false){
-    if(this.busy||this.stopped||document.hidden)return;this.busy=true;this.paused=false;
+    if(this.busy||this.stopped||document.hidden)return;this.busy=true;this.paused=false;this.backgrounded=false;
     try{
       this.state.resumeSync=!dryRun;await this.persist();this.setProgress({phase:'Сверка…',done:0,total:0});
       const binding=this.origin()+'|'+this.state.settings.folderId;
@@ -155,7 +155,7 @@ export default class NoteBridge extends Plugin {
       if(dryRun)new HistoryModal(this.app,events).open();
       else new Notice(pending?`Note Bridge: ${pending} конфликтов/удалений требуют проверки`:'Note Bridge: синхронизация завершена');
     }catch(error){
-      const suspended=error instanceof Paused||document.hidden;
+      const suspended=error instanceof Paused||this.backgrounded||document.hidden;
       const message=suspended?'Пауза. Выполненные операции сохранены.':error instanceof Error?error.message:'Неизвестная ошибка';
       this.setProgress({...this.progress,phase:suspended?'Приостановлено':'Ошибка: '+message});
       if(!suspended){this.state.resumeSync=false;new Notice(message,12000);}
@@ -169,7 +169,7 @@ export default class NoteBridge extends Plugin {
 class BridgeSettings extends PluginSettingTab {
   constructor(app:App,private p:NoteBridge){super(app,p);}
   display(){
-    const el=this.containerEl;el.empty();el.createEl('h2',{text:'Note Bridge · тестовая версия 0.1.1'});
+    const el=this.containerEl;el.empty();el.createEl('h2',{text:'Note Bridge · тестовая версия 0.1.2'});
     el.createEl('p',{text:'Используйте отдельную копию хранилища. Автоудаление и переименование пока не распространяются. Лимит файла — 10 МБ. Другие средства синхронизации этого хранилища должны быть отключены.'});
     new Setting(el).setName('Адрес сервиса авторизации').setDesc('https://имя.workers.dev').addText(t=>t.setValue(this.p.state.settings.workerUrl).onChange(async v=>{if(this.p.busy)return;this.p.state.settings.workerUrl=v.trim();this.p.access=undefined;await this.p.persist();}));
     new Setting(el).setName('ID папки Google Drive').setDesc('Часть адреса после /folders/. Папку создайте заранее.').addText(t=>t.setValue(this.p.state.settings.folderId).onChange(async v=>{if(this.p.busy)return;this.p.state.settings.folderId=v.trim();await this.p.persist();}));
