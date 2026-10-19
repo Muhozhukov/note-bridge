@@ -3,3 +3,14 @@
 .nb-explorer-sync.nb-sync-active { color:var(--interactive-accent); }
 .nb-sync-active svg { animation: nb-spin 1.2s linear infinite; transform-origin:center; }
 @keyframes nb-spin { to { transform:rotate(360deg); } }
+.nb-conflict-card { border:1px solid var(--background-modifier-border); border-radius:10px; padding:12px; margin:12px 0; }
+.nb-danger-card { border-inline-start:4px solid var(--text-error); padding-inline-start:12px; }
+.nb-danger-card .setting-item-name,.nb-danger-card .nb-conflict-label,.nb-danger-card > strong { color:var(--text-error); }
+.nb-event-time { font-size:var(--font-smallest); color:var(--text-muted); margin:4px 0; }
+.nb-conflict-label { font-size:var(--font-small); font-weight:600; margin-bottom:8px; }
+.nb-merge pre { white-space:pre-wrap; overflow-wrap:anywhere; padding:10px; font-size:var(--font-small); }
+.nb-diff-minus { color:var(--text-error); background:rgba(220,50,50,.10); }
+.nb-diff-plus { color:var(--text-success,#218b4e); background:rgba(40,180,90,.10); }
+.nb-merge-editor { width:100%; min-height:45vh; resize:vertical; font-family:var(--font-monospace); }
+.nb-conflict-card .setting-item { flex-wrap:wrap; gap:10px; }
+.nb-conflict-card .setting-item-control { flex-wrap:wrap; }

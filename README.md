@@ -1,4 +1,4 @@
-# Note Bridge — 0.2.0 (experimental)
+# Note Bridge — 0.3.0 (experimental)
 
 Плагин Obsidian для синхронизации локального хранилища с обычными файлами Google Drive и персональный OAuth-сервис на Cloudflare Workers.
 

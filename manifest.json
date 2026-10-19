@@ -1,7 +1,7 @@
 {
   "id": "note-bridge",
   "name": "Note Bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "minAppVersion": "1.11.4",
   "description": "Synchronize a local vault with Google Drive using conservative conflict handling.",
   "author": "Note Bridge contributors",

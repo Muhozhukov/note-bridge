@@ -1,3 +1,4 @@
+import {mergeVersions} from '../../core/merge';
 import {ResolutionModal,type Review} from './resolution';
 import {under,remapBaseline,duplicateFolders,type Rename} from '../../core/changes';
 import {Paused,type Progress} from '../../core/control';
@@ -11,8 +12,20 @@ const defaults:Settings={workerUrl:'https://note-bridge-auth.pravoepredserdie.wo
 class HistoryModal extends Modal {
   constructor(app:App,private events:Event[]){super(app);}
   onOpen(){this.titleEl.setText('Note Bridge — журнал');this.contentEl.createEl('p',{text:'Журнал этого устройства. Снимки файлов сохраняются в служебной папке .note-bridge-history в Google Drive. Автоматический откат пока не реализован.'});
-    new Setting(this.contentEl).addButton(b=>b.setButtonText('Скопировать журнал').onClick(()=>{void navigator.clipboard.writeText(JSON.stringify({version:'0.2.0',events:this.events},null,2)).then(()=>new Notice('Журнал скопирован')).catch(()=>new Notice('Копирование недоступно; используйте экспорт из настроек.'));}));
-    for(const e of this.events.slice(-100).reverse())this.contentEl.createEl('p',{text:`${e.time} · ${e.action} · ${e.path}${e.detail?' — '+e.detail:''}`});}
+    new Setting(this.contentEl).addButton(b=>b.setButtonText('Скопировать журнал').onClick(()=>{void navigator.clipboard.writeText(JSON.stringify({version:'0.3.0',events:this.events},null,2)).then(()=>new Notice('Журнал скопирован')).catch(()=>new Notice('Копирование недоступно; используйте экспорт из настроек.'));}));
+    const labels:Record<string,string>={upload:'Отправлено в Google Drive',download:'Скачано на устройство',conflict:'Нужно объединить изменения','local-deletion':'Удалено на телефоне — ожидает решения','remote-deletion':'Удалено в Drive — ожидает решения','duplicate-to-trash':'Дубликат перенесён в корзину',resolved:'Конфликт разрешён','resolution-trash-local':'Файл перенесён в локальную корзину','resolution-trash-remote':'Файл перенесён в корзину Drive',merged:'Изменения объединены',rename:'Переименовано',complete:'Синхронизация завершена',paused:'Синхронизация приостановлена',error:'Ошибка синхронизации'};
+    const list=this.contentEl.createDiv();
+    const render=(onlyIssues:boolean)=>{list.empty();const events=this.events.slice(-100).reverse().filter(e=>!onlyIssues||['conflict','local-deletion','remote-deletion','duplicate-to-trash','resolved','merged','error','resolution-trash-local','resolution-trash-remote'].includes(e.action));
+      if(!events.length)list.createEl('p',{text:'Нет событий для отображения.'});
+      for(const e of events){const card=list.createDiv({cls:'nb-conflict-card'+(e.action.includes('deletion')||e.action.includes('trash')?' nb-danger-card':'')});
+        card.createEl('strong',{text:labels[e.action]||e.action});card.createEl('div',{text:new Date(e.time).toLocaleString('ru-RU'),cls:'nb-event-time'});
+        if(e.path)card.createEl('div',{text:e.path,cls:'nb-path'});
+        if(e.detail)card.createEl('p',{text:e.action==='resolved'?(e.detail==='local'?'Выбрано состояние телефона':'Выбрано состояние Google Drive'):e.action==='rename'?'Предыдущий путь: '+e.detail:e.detail});
+      }
+    };
+    new Setting(this.contentEl).setName('Только конфликты, удаления и ошибки').addToggle(t=>t.setValue(true).onChange(render));render(true);
+    this.contentEl.createEl('p',{text:'Это история событий, а не список нерешённых конфликтов. Актуальные действия доступны в «Конфликты и удаления».'});}
+
 }
 class ProgressModal extends Modal {
   private render=()=>{
@@ -92,6 +105,25 @@ export default class NoteBridge extends Plugin {
     try{return await fn();}finally{this.busy=false;this.setProgress({...this.progress,phase:'Готов'});}
   }
   async review():Promise<Review>{return this.exclusive(async()=>{const drive=this.drive();return {local:await this.local().scan(),remote:await drive.scan(),folders:drive.folders};});}
+  async conflictText(path:string,review:Review){
+    return this.exclusive(async()=>{
+      if(!/\.(md|txt)$/i.test(path))throw new Error('Построчное сравнение доступно для Markdown и TXT.');
+      const l=review.local.get(path),r=review.remote.get(path);if(!l||!r)throw new Error('Одна из версий отсутствует; обновите список');
+      const bytes=await this.local().read(path);if(await hash(bytes)!==l.hash)throw new Error('Текст телефона изменился; обновите список');
+      const remote=await this.drive().read(r);const decoder=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true});
+      return {local:decoder.decode(bytes),remote:decoder.decode(remote)};
+    });
+  }
+  async saveMerged(path:string,text:string,review:Review){
+    await this.exclusive(async()=>{
+      if(!/\.(md|txt)$/i.test(path))throw new Error('Объединение доступно только для Markdown и TXT');
+      const drive=this.drive(),local=this.local(),ls=await local.scan(),rs=await drive.scan();
+      const l=ls.get(path),r=rs.get(path),old=review.remote.get(path);
+      if(!l||!r||l.hash!==review.local.get(path)?.hash||r.hash!==old?.hash||r.id!==old?.id||r.version!==old?.version)throw new Error('Заметка изменилась после открытия сравнения. Скопируйте итоговый текст, закройте сравнение и обновите список конфликтов.');
+      this.state.baseline[path]=await mergeVersions(path,text,local,drive,l,r);
+      this.state.events.push({time:new Date().toISOString(),path,action:'merged',detail:'Изменения объединены по блокам; обе исходные версии сохранены в истории'});await this.persist();
+    });
+  }
   async resolve(path:string,side:'local'|'remote',review:Review){
     await this.exclusive(async()=>{
       const drive=this.drive(),local=this.local(),ls=await local.scan(),rs=await drive.scan();const l=ls.get(path),r=rs.get(path);
@@ -104,7 +136,7 @@ export default class NoteBridge extends Plugin {
         if(r){const bytes=await drive.read(r);if(l)await drive.snapshot(path,await local.read(path),'resolution-local');await local.write(path,bytes,l?.hash);this.state.baseline[path]={hash:r.hash,remoteId:r.id};}
         else if(l){await drive.snapshot(path,await local.read(path),'resolution-local-delete');await local.trash!(path,l.hash);delete this.state.baseline[path];}
       }
-      this.state.events.push({time:new Date().toISOString(),path,action:'resolved',detail:side});await this.persist();
+      this.state.events.push({time:new Date().toISOString(),path,action:side==='local'&&!l?'resolution-trash-remote':side==='remote'&&!r?'resolution-trash-local':'resolved',detail:side==='local'&&!l||side==='remote'&&!r?'Удаление подтверждено пользователем':side});await this.persist();
     });
   }
   async removeDuplicate(pair:{from:string;to:string;count:number},review:Review){
@@ -291,7 +323,7 @@ export default class NoteBridge extends Plugin {
 class BridgeSettings extends PluginSettingTab {
   constructor(app:App,private p:NoteBridge){super(app,p);}
   display(){
-    const el=this.containerEl;el.empty();el.createEl('h2',{text:'Note Bridge · тестовая версия 0.2.0'});
+    const el=this.containerEl;el.empty();el.createEl('h2',{text:'Note Bridge · тестовая версия 0.3.0'});
     el.createEl('p',{text:'Используйте отдельную копию хранилища. Удаления требуют подтверждения в разделе «Конфликты и удаления». Лимит файла — 10 МБ. Другие средства синхронизации этого хранилища должны быть отключены.'});
     new Setting(el).setName('Адрес сервиса авторизации').setDesc('https://имя.workers.dev').addText(t=>t.setValue(this.p.state.settings.workerUrl).onChange(async v=>{if(this.p.busy)return;this.p.state.settings.workerUrl=v.trim();this.p.access=undefined;await this.p.persist();}));
     new Setting(el).setName('ID папки Google Drive').setDesc('Часть адреса после /folders/. Папку создайте заранее.').addText(t=>t.setValue(this.p.state.settings.folderId).onChange(async v=>{if(this.p.busy)return;this.p.state.settings.folderId=v.trim();await this.p.persist();}));
