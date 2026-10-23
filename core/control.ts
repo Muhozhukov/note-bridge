@@ -1,3 +1,4 @@
+export class StorageFailure extends Error {}
 export class Paused extends Error { constructor(){super('Синхронизация приостановлена');} }
 export type Progress={phase:string;done:number;total:number;path?:string};
 export type Control={check?:()=>void;progress?:(value:Progress)=>void};
@@ -7,8 +8,8 @@ export async function retryRead<T>(operation:()=>Promise<T>,check:()=>void=()=>{
     check();
     try{return await operation();}catch(error){
       check();
-      if(attempt>=2||!(error instanceof Error)||!(/timeout|timed out|network|fetch|соединен|сети|времени|HTTP (429|500|502|503|504)/i.test(error.message)))throw error;
-      await delay(1000*2**attempt);
+      if(attempt>=4||!(error instanceof Error)||!(/timeout|timed out|network|fetch|соединен|сети|времени|HTTP (429|500|502|503|504)|rateLimitExceeded|userRateLimitExceeded/i.test(error.message)))throw error;
+      await delay(Math.min(16000,1000*2**attempt)+Math.floor(Math.random()*250));
     }
   }
 }

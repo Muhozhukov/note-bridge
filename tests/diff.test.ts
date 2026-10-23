@@ -23,3 +23,8 @@ async function fixture(){
 test('merge backs up both originals and updates both sides',async()=>{const f=await fixture();const base=await mergeVersions('a.md','combined',f.local,f.remote,f.l,f.r);assert.equal(f.phone(),'combined');assert.equal(f.drive(),'combined');assert.equal(f.snapshots.length,2);assert.equal(base.hash,await hash(bytes('combined')));});
 test('concurrent local edit survives partial merge; merged remote result is retained',async()=>{const f=await fixture();f.change();await assert.rejects(mergeVersions('a.md','combined',f.local,f.remote,f.l,f.r),/Итог сохранён в Drive/);assert.equal(f.phone(),'new user edit');assert.equal(f.drive(),'combined');assert.equal(f.snapshots.length,2);});
 test('stale local or remote content blocks merged writes',async()=>{const f=await fixture();await assert.rejects(mergeVersions('a.md','combined',f.local,f.remote,{...f.l,hash:'stale'},f.r),/телефона изменился/);await assert.rejects(mergeVersions('a.md','combined',f.local,f.remote,f.l,{...f.r,hash:'stale'}),/Drive изменился/);assert.equal(f.drive(),'drive');assert.equal(f.phone(),'phone');assert.equal(f.snapshots.length,0);});
+
+test('patience anchors handle long notes with distant edits without a quadratic table',()=>{
+ const rows=Array.from({length:5000},(_,i)=>'unique line '+i+'\n'),left=[...rows],right=[...rows];left[0]='local first\n';right[4999]='remote last\n';
+ const parts=compare(left.join(''),right.join(''));const choices=new Map<number,'local'|'remote'>();parts.forEach((p,i)=>{if(p.kind==='change')choices.set(i,'local');});assert.equal(assemble(parts,choices),left.join(''));parts.forEach((p,i)=>{if(p.kind==='change')choices.set(i,'remote');});assert.equal(assemble(parts,choices),right.join(''));
+});

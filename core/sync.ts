@@ -1,3 +1,5 @@
+import {threeWay} from './three-way';
+import {Paused,StorageFailure} from './control';
 import {pool,type Control} from './control';
 export type Action = 'none' | 'upload' | 'download' | 'conflict' | 'local-deletion' | 'remote-deletion';
 /** Absence is not deletion unless a baseline exists. Never compare wall-clock dates. */
@@ -37,10 +39,11 @@ export interface Remote {
   trash?(entry:Entry):Promise<void>;
   snapshot(path: string, bytes: ArrayBuffer, source: string): Promise<void>;
 }
+export type SyncOptions={recover?:(locals:Map<string,Entry>,remotes:Map<string,Entry>,baseline:Baseline)=>Promise<string[]>;local?:Set<string>;remote?:Set<string>;conflicts?:Record<string,string>;cached?:(hash:string)=>Promise<ArrayBuffer|undefined>;remember?:(bytes:ArrayBuffer)=>Promise<void>;prepare?:(path:string,action:Action,l?:Entry,r?:Entry)=>Promise<void>;isolateErrors?:boolean};
 export class SyncEngine {
   running = false;
   constructor(private local: Local, private remote: Remote, public baseline: Baseline,
-    private checkpoint: (base: Baseline, event: Event)=>Promise<void>, private control:Control={}, private deletions:{local?:Set<string>;remote?:Set<string>;conflicts?:Record<string,string>}={}) {}
+    private checkpoint: (base: Baseline, event: Event)=>Promise<void>, private control:Control={}, private deletions:SyncOptions={}) {}
   async run(dryRun = false): Promise<Event[]> {
     if (this.running) throw new Error('Синхронизация уже выполняется');
     this.running = true;
@@ -56,6 +59,7 @@ export class SyncEngine {
       const locals = await this.local.scan();
       this.control.progress?.({phase:'Сканирование Google Drive',done:0,total:0});
       const remotes = await this.remote.scan();
+      if(!dryRun)for(const path of await this.deletions.recover?.(locals,remotes,this.baseline)||[])await emit(path,'recovered','Подтверждён результат прерванной операции');
       // Stable Drive IDs identify remote renames without copying file contents.
       if(!dryRun&&this.local.move){
         const byId=new Map([...remotes.values()].filter(e=>e.id).map(e=>[e.id!,e]));
@@ -72,7 +76,7 @@ export class SyncEngine {
           this.baseline[moved.path]=b;delete this.baseline[old];await emit(moved.path,'rename',old);
         }
       }
-      const paths = [...new Set([...locals.keys(),...remotes.keys(),...Object.keys(this.baseline)])].sort();
+      const paths = [...new Set([...locals.keys(),...remotes.keys(),...Object.keys(this.baseline)])];
       const fold = new Map<string,string>();
       // Historical paths absent on both sides must not block a renamed folder.
       for (const path of new Set([...locals.keys(),...remotes.keys()])) {
@@ -88,7 +92,7 @@ export class SyncEngine {
       const total=paths.filter(p=>decide(this.baseline[p]?.hash,locals.get(p)?.hash,remotes.get(p)?.hash)!=='none').length;
       let done=0;
       this.control.progress?.({phase:'Синхронизация',done,total});
-      await pool(paths,async(path)=>{
+      const work=async(path:string)=>{
         this.control.check?.();
         const l=locals.get(path), r=remotes.get(path), b=this.baseline[path];
         const action=decide(b?.hash,l?.hash,r?.hash);
@@ -100,6 +104,7 @@ export class SyncEngine {
           else delete this.baseline[path];
           return;
         }
+        await this.deletions.prepare?.(path,action,l,r);
         if (action==='local-deletion'||action==='remote-deletion') {
           if(action==='local-deletion'&&r&&r.hash===b?.hash&&r.id===b.remoteId&&this.deletions.local?.has(path)&&this.remote.trash){
             if(this.local.exists?.(path))throw new Error('Локальный файл появился перед удалением: '+path);
@@ -115,15 +120,27 @@ export class SyncEngine {
           const bytes=await this.local.read(path);
           if(await hash(bytes)!==l!.hash) throw new Error('Локальный файл изменился во время синка: '+path);
           // First upload already creates a durable copy; snapshot only before overwrite.
-          if(r)await this.remote.snapshot(path,bytes,'local');
-          if(r) await this.remote.snapshot(path,await this.remote.read(r),'remote-before-upload');
+          if(r){const old=await this.deletions.cached?.(r.hash)||await this.remote.read(r);await this.remote.snapshot(path,old,'remote-before-upload');}
           const result=await this.remote.write(path,bytes,r);
+          await this.deletions.remember?.(bytes);
           this.baseline[path]={hash:l!.hash,remoteId:result.id};
         } else {
           const fingerprint=l?.hash+'|'+r?.id+'|'+r?.hash;
           if(action==='conflict'&&this.deletions.conflicts?.[path]===fingerprint){await emit(path,action,'Ожидает решения; версии не изменились');advance();return;}
           const bytes=await this.remote.read(r!);
           if(await hash(bytes)!==r!.hash) throw new Error('Удалённый файл изменился: '+path);
+          if(action==='conflict'&&b&&/\.(md|txt)$/i.test(path)&&this.deletions.cached){
+            const base=await this.deletions.cached(b.hash),localBytes=await this.local.read(path);
+            if(base&&await hash(localBytes)===l!.hash){
+              let merged:string|undefined;try{const decoder=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true});merged=threeWay(decoder.decode(base),decoder.decode(localBytes),decoder.decode(bytes));}catch{}
+              if(merged!==undefined){
+                await this.remote.snapshot(path,localBytes,'before-auto-merge-local');await this.remote.snapshot(path,bytes,'before-auto-merge-remote');
+                const result=new TextEncoder().encode(merged).buffer,saved=await this.remote.write(path,result,r);
+                await this.local.write(path,result,l!.hash);await this.deletions.remember?.(result);
+                this.baseline[path]={hash:await hash(result),remoteId:saved.id};await emit(path,'merged','Независимые правки объединены автоматически');advance();return;
+              }
+            }
+          }
           if(action==='conflict') {
             await this.remote.snapshot(path,bytes,'remote-conflict');
             await this.remote.snapshot(path,await this.local.read(path),'local-conflict');
@@ -134,9 +151,17 @@ export class SyncEngine {
           }
           if(l) await this.remote.snapshot(path,await this.local.read(path),'local-before-download');
           await this.local.write(path,bytes,l?.hash);
+          await this.deletions.remember?.(bytes);
           this.baseline[path]={hash:r!.hash,remoteId:r!.id};
         }
         await emit(path,action); advance();
+      };
+      const planned=paths.filter(path=>decide(this.baseline[path]?.hash,locals.get(path)?.hash,remotes.get(path)?.hash)!=='none'||this.baseline[path]?.remoteId!==remotes.get(path)?.id||this.baseline[path]?.hash!==locals.get(path)?.hash||(!locals.has(path)&&!!this.baseline[path]));
+      await pool(planned,async path=>{
+        try{await work(path);}catch(e){
+          if(!this.deletions.isolateErrors||e instanceof Paused||e instanceof StorageFailure||/журнал|HTTP (401|403|429|5\d\d)|timeout|timed out|network|fetch/i.test(String(e)))throw e;
+          await emit(path,'error',String(e));
+        }
       },dryRun?1:3);
 
       this.control.check?.();

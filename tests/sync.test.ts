@@ -26,7 +26,7 @@ async function base(s:string):Promise<Baseline>{return {'a.md':{hash:await hash(
 test('first empty device downloads rather than deletes',async()=>{const l=new Memory({}),r=new Memory({'a.md':'remote'});const e=new SyncEngine(local(l),r,{},async()=>{});await e.run();assert.equal(new TextDecoder().decode(l.files.get('a.md')),'remote');});
 test('offline edits conflict; both originals preserved; repeated sync deduplicates copy',async()=>{const l=new Memory({'a.md':'local'}),r=new Memory({'a.md':'remote'});const baseline=await base('old');const e=new SyncEngine(local(l),r,baseline,async()=>{});await e.run();await e.run();assert.equal(l.conflicts.size,1);assert.equal(new TextDecoder().decode(l.files.get('a.md')),'local');assert.equal(new TextDecoder().decode(r.files.get('a.md')),'remote');assert.equal(baseline['a.md'].hash,await hash(bytes('old')));});
 test('network failure cannot trigger writes or deletions',async()=>{const l=new Memory({'a.md':'local'}),r=new Memory({});r.failScan=true;const e=new SyncEngine(local(l),r,await base('old'),async()=>{});await assert.rejects(e.run());assert.equal(l.files.size,1);assert.equal(r.files.size,0);assert.equal(r.backups.length,0);});
-test('remote concurrent edit rejects upload after snapshots',async()=>{const l=new Memory({'a.md':'local'}),r=new Memory({'a.md':'old'});r.beforeWrite=()=>r.files.set('a.md',bytes('external'));const e=new SyncEngine(local(l),r,await base('old'),async()=>{});await assert.rejects(e.run());assert.equal(new TextDecoder().decode(r.files.get('a.md')),'external');assert.equal(r.backups.length,2);});
+test('remote concurrent edit rejects upload after snapshots',async()=>{const l=new Memory({'a.md':'local'}),r=new Memory({'a.md':'old'});r.beforeWrite=()=>r.files.set('a.md',bytes('external'));const e=new SyncEngine(local(l),r,await base('old'),async()=>{});await assert.rejects(e.run());assert.equal(new TextDecoder().decode(r.files.get('a.md')),'external');assert.equal(r.backups.length,1);});
 test('local edit during download is preserved',async()=>{const l=new Memory({'a.md':'old'}),r=new Memory({'a.md':'remote'});l.beforeWrite=()=>l.files.set('a.md',bytes('typed'));const e=new SyncEngine(local(l),r,await base('old'),async()=>{});await assert.rejects(e.run());assert.equal(new TextDecoder().decode(l.files.get('a.md')),'typed');});
 test('dry run leaves baseline, files and history untouched',async()=>{const l=new Memory({'a.md':'new'}),r=new Memory({'a.md':'old'});const b=await base('old');const original=JSON.stringify(b);let checkpoints=0;const e=new SyncEngine(local(l),r,b,async()=>{checkpoints++;});assert.equal((await e.run(true))[0].action,'upload');assert.equal(checkpoints,0);assert.equal(r.backups.length,0);assert.equal(JSON.stringify(b),original);});
 test('case collision stops entire run before writes',async()=>{const l=new Memory({'Note.md':'a'}),r=new Memory({'note.md':'b'});await assert.rejects(new SyncEngine(local(l),r,{},async()=>{}).run(),/регистр/);assert.equal(r.backups.length,0);});
@@ -95,4 +95,22 @@ test('explicit remote trash removes only unchanged local version and preserves a
  const events=await new SyncEngine(adapter,r,b,async()=>{},{},{remote:new Set(['a.md'])}).run();
  assert.equal(removed,edited?0:1);assert.equal(events[0].action,edited?'remote-deletion':'resolution-trash-local');assert.equal(r.backups.length,edited?0:1);
  }
+});
+
+test('a changed but equal pair advances baseline even when remote ID is unchanged',async()=>{const l=new Memory({'a.md':'same-new'}),r=new Memory({'a.md':'same-new'}),b=await base('old');b['a.md'].remoteId='a.md';await new SyncEngine(local(l),r,b,async()=>{}).run();assert.equal(b['a.md'].hash,await hash(bytes('same-new')));});
+test('cached common version removes remote read and redundant snapshot on upload',async()=>{
+ const l=new Memory({'a.md':'new'}),r=new Memory({'a.md':'old'}),b=await base('old');let reads=0;const original=r.read.bind(r);r.read=async(...args)=>{reads++;return original(...args);};let remembered='';
+ await new SyncEngine(local(l),r,b,async()=>{},{},{cached:async h=>h===await hash(bytes('old'))?bytes('old'):undefined,remember:async data=>{remembered=new TextDecoder().decode(data);}}).run();assert.equal(reads,0);assert.equal(r.backups.length,1);assert.equal(remembered,'new');
+});
+test('independent text edits merge automatically using cached common ancestor',async()=>{
+ const old='a\nb\nc\nd\n',left='A\nb\nc\nd\n',right='a\nb\nc\nD\n';const l=new Memory({'a.md':left}),r=new Memory({'a.md':right}),b=await base(old);
+ const events=await new SyncEngine(local(l),r,b,async()=>{},{},{cached:async()=>bytes(old)}).run();assert.equal(new TextDecoder().decode(l.files.get('a.md')),'A\nb\nc\nD\n');assert.equal(new TextDecoder().decode(r.files.get('a.md')),'A\nb\nc\nD\n');assert.equal(events[0].action,'merged');assert.equal(r.backups.length,2);
+});
+test('one file precondition failure does not prevent unrelated files from syncing',async()=>{
+ const l=new Memory({'a.md':'new-a','b.md':'new-b'}),r=new Memory({'a.md':'old-a','b.md':'old-b'});const b:Baseline={'a.md':{hash:await hash(bytes('old-a'))},'b.md':{hash:await hash(bytes('old-b'))}};
+ const original=r.write.bind(r);r.write=async(p,...args)=>{if(p==='a.md')throw new Error('Version changed');return original(p,...args);};
+ const events=await new SyncEngine(local(l),r,b,async()=>{},{},{isolateErrors:true}).run();assert.ok(events.some(e=>e.path==='a.md'&&e.action==='error'));assert.equal(new TextDecoder().decode(r.files.get('b.md')),'new-b');assert.equal(new TextDecoder().decode(r.files.get('a.md')),'old-a');
+});
+test('failure to persist intention prevents all external effects',async()=>{
+ const l=new Memory({'a.md':'new'}),r=new Memory({});await assert.rejects(new SyncEngine(local(l),r,{},async()=>{},{},{prepare:async()=>{throw new Error('журнал недоступен');},isolateErrors:true}).run(),/журнал/);assert.equal(r.files.size,0);assert.equal(r.backups.length,0);
 });

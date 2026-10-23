@@ -1,3 +1,4 @@
+import {Journal} from '../../core/journal';
 import {autosyncDelay} from '../../core/scheduling';
 import {mergeVersions} from '../../core/merge';
 import {ResolutionModal,type Review} from './resolution';
@@ -5,16 +6,14 @@ import {under,remapBaseline,duplicateFolders,type Rename} from '../../core/chang
 import {Paused,type Progress} from '../../core/control';
 import {Plugin,PluginSettingTab,Setting,Notice,Modal,TFile,TFolder,requestUrl,setIcon,type App} from 'obsidian';
 import {SyncEngine,hash,validPath,type Baseline,type Event,type Local,type Entry} from '../../core/sync';
-import {Drive,type DriveIndex} from './drive';
+import {Drive,type DriveIndex,type WriteIntent} from './drive';
 import {random,digest} from '../../auth-service/src/crypto';
-type Settings={workerUrl:string;folderId:string;autoSync:boolean;intervalSeconds:number;deviceName:string;secretId:string};
-type Saved={noticeKey?:string;conflicts?:Record<string,string>;driveIndex?:DriveIndex;deleted?:string[];lastProgress?:Progress;settings:Settings;baseline:Baseline;events:Event[];binding?:string;resumeSync?:boolean;renames?:(Rename&{id?:string})[];autoMigration?:boolean};
-const defaults:Settings={workerUrl:'https://note-bridge-auth.pravoepredserdie.workers.dev',folderId:'',autoSync:true,intervalSeconds:120,deviceName:'Моё устройство',secretId:''};
+import {applyRecord,defaults,type Saved,type StateRecord} from './state';
 class HistoryModal extends Modal {
   constructor(app:App,private events:Event[]){super(app);}
   onOpen(){this.titleEl.setText('Note Bridge — журнал');this.contentEl.createEl('p',{text:'Журнал этого устройства. Снимки файлов сохраняются в служебной папке .note-bridge-history в Google Drive. Автоматический откат пока не реализован.'});
-    new Setting(this.contentEl).addButton(b=>b.setButtonText('Скопировать журнал').onClick(()=>{void navigator.clipboard.writeText(JSON.stringify({version:'0.4.0',events:this.events},null,2)).then(()=>new Notice('Журнал скопирован')).catch(()=>new Notice('Копирование недоступно; используйте экспорт из настроек.'));}));
-    const labels:Record<string,string>={upload:'Отправлено в Google Drive',download:'Скачано на устройство',conflict:'Нужно объединить изменения','local-deletion':'Удалено на телефоне — ожидает решения','remote-deletion':'Удалено в Drive — ожидает решения','duplicate-to-trash':'Дубликат перенесён в корзину',resolved:'Конфликт разрешён','resolution-trash-local':'Файл перенесён в локальную корзину','resolution-trash-remote':'Файл перенесён в корзину Drive',merged:'Изменения объединены',rename:'Переименовано',complete:'Синхронизация завершена',paused:'Синхронизация приостановлена',error:'Ошибка синхронизации'};
+    new Setting(this.contentEl).addButton(b=>b.setButtonText('Скопировать журнал').onClick(()=>{void navigator.clipboard.writeText(JSON.stringify({version:'0.5.0',events:this.events},null,2)).then(()=>new Notice('Журнал скопирован')).catch(()=>new Notice('Копирование недоступно; используйте экспорт из настроек.'));}));
+    const labels:Record<string,string>={upload:'Отправлено в Google Drive',download:'Скачано на устройство',conflict:'Нужно объединить изменения','local-deletion':'Удалено на телефоне — ожидает решения','remote-deletion':'Удалено в Drive — ожидает решения','duplicate-to-trash':'Дубликат перенесён в корзину',resolved:'Конфликт разрешён','resolution-trash-local':'Файл перенесён в локальную корзину','resolution-trash-remote':'Файл перенесён в корзину Drive',metrics:'Статистика запросов Drive',merged:'Изменения объединены',recovered:'Прерванная операция подтверждена',rename:'Переименовано',complete:'Синхронизация завершена',paused:'Синхронизация приостановлена',error:'Ошибка синхронизации'};
     const list=this.contentEl.createDiv();
     const render=(onlyIssues:boolean)=>{list.empty();const events=this.events.slice(-100).reverse().filter(e=>!onlyIssues||['conflict','local-deletion','remote-deletion','duplicate-to-trash','resolved','merged','error','resolution-trash-local','resolution-trash-remote'].includes(e.action));
       if(!events.length)list.createEl('p',{text:'Нет событий для отображения.'});
@@ -46,9 +45,11 @@ class ProgressModal extends Modal {
   onClose(){this.plugin.reviewing--;this.plugin.listeners.delete(this.render);}
 }
 export default class NoteBridge extends Plugin {
+  journal!:Journal<Saved,StateRecord>;
   state:Saved={settings:{...defaults},baseline:{},events:[]};
   status!:HTMLElement; busy=false; stopped=false; timer:number|undefined; saveQueue:Promise<void>=Promise.resolve();
   progress:Progress={phase:'Готов',done:0,total:0}; listeners=new Set<()=>void>(); paused=false; backgrounded=false; explorerButtons=new Set<HTMLElement>();
+  internalPaths=new Map<string,number>();
   reviewing=0;applying=0;dirty=false;ribbon?:HTMLElement;
   lastSync=0;lastEdit=0;
   cacheEpoch=0;
@@ -56,8 +57,12 @@ export default class NoteBridge extends Plugin {
   tokenRequest?:Promise<string>;
   access?:{token:string;expires:number}; pending?:{session:string;verifier:string};
   async onload(){
-    const loaded=await this.loadData() as Partial<Saved>|null;
-    this.state={settings:{...defaults,...loaded?.settings},baseline:loaded?.baseline||{},events:loaded?.events||[],binding:loaded?.binding,resumeSync:loaded?.resumeSync,renames:loaded?.renames||[],autoMigration:true,noticeKey:loaded?.noticeKey,conflicts:loaded?.conflicts||{},driveIndex:loaded?.driveIndex,deleted:loaded?.deleted||[],lastProgress:loaded?.lastProgress};
+    const fallback=(await this.loadData()||{settings:{...defaults},baseline:{},events:[]}) as Saved;
+    const dir=this.manifest.dir;if(!dir)throw new Error('Не найден каталог плагина');
+    this.journal=new Journal(this.app.vault.adapter,dir+'/state',applyRecord);
+    const loaded=await this.journal.load(fallback);
+    if(!await this.app.vault.adapter.exists(dir+'/state/blobs'))await this.app.vault.adapter.mkdir(dir+'/state/blobs');
+    this.state={settings:{...defaults,...loaded?.settings},baseline:loaded?.baseline||{},events:loaded?.events||[],binding:loaded?.binding,resumeSync:loaded?.resumeSync,renames:loaded?.renames||[],autoMigration:true,operations:loaded?.operations||{},pending:loaded?.pending||{},history:loaded?.history||{},noticeKey:loaded?.noticeKey,conflicts:loaded?.conflicts||{},driveIndex:loaded?.driveIndex,deleted:loaded?.deleted||[],lastProgress:loaded?.lastProgress};
     if(this.state.lastProgress)this.progress=this.state.lastProgress;
     if(!loaded?.autoMigration)this.state.settings.autoSync=true;
     if(!this.state.settings.secretId)this.state.settings.secretId='note-bridge-'+crypto.randomUUID();
@@ -81,13 +86,13 @@ export default class NoteBridge extends Plugin {
     this.addCommand({id:'history',name:'Показать журнал',callback:()=>new HistoryModal(this.app,this.state.events).open()});
     this.addSettingTab(new BridgeSettings(this.app,this));
     const schedule=()=>this.schedule();
-    const changed=(file:{path:string})=>{this.cacheEpoch++;this.localCache.delete(file.path);if(this.applying||!validPath(file.path))return;this.lastEdit=Date.now();this.schedule();};
+    const changed=(file:{path:string})=>{this.cacheEpoch++;this.localCache.delete(file.path);if(this.internalPaths.has(file.path)||!validPath(file.path))return;this.lastEdit=Date.now();this.schedule();};
     this.registerEvent(this.app.vault.on('modify',changed));this.registerEvent(this.app.vault.on('create',changed));
     this.registerEvent(this.app.vault.on('delete',file=>{
-      if(!this.applying){for(const path of Object.keys(this.state.baseline))if(under(path,file.path)&&!this.state.deleted!.includes(path))this.state.deleted!.push(path);void this.persist();}changed(file);
+      if(!this.internalPaths.has(file.path)){for(const path of Object.keys(this.state.baseline))if(under(path,file.path)&&!this.state.deleted!.includes(path))this.state.deleted!.push(path);void this.persist();}changed(file);
     }));
     this.registerEvent(this.app.vault.on('rename',(file,old)=>{
-      this.localCache.clear();if(this.applying||!validPath(old)||!validPath(file.path))return;this.lastEdit=Date.now();
+      this.localCache.clear();if(this.internalPaths.has(old)||this.internalPaths.has(file.path)||!validPath(old)||!validPath(file.path))return;this.lastEdit=Date.now();
       const queue=this.state.renames!;const prior=queue.find(r=>r.to===old);
       if(prior)prior.to=file.path;else queue.push({from:old,to:file.path,folder:file instanceof TFolder});
       void this.persist();this.schedule();
@@ -100,15 +105,16 @@ export default class NoteBridge extends Plugin {
     this.app.workspace.onLayoutReady(()=>{if(this.state.resumeSync&&!document.hidden)void this.sync();else schedule();});
   }
   schedule(){
-    if(this.applying||!this.state.settings.autoSync||this.stopped||this.paused||this.reviewing)return;
+    if(!this.state.settings.autoSync||this.stopped||this.paused||this.reviewing)return;
     if(this.busy){this.dirty=true;return;}
     if(!this.state.settings.folderId||!this.app.secretStorage?.getSecret(this.state.settings.secretId))return;
     if(this.timer)window.clearTimeout(this.timer);const delay=autosyncDelay(Date.now(),this.lastEdit,this.lastSync);this.timer=window.setTimeout(()=>{void this.sync(false,true);},delay);
   }
-  async quiet<T>(fn:()=>Promise<T>):Promise<T>{this.applying++;try{return await fn();}finally{this.applying--;}}
+  async quiet<T>(paths:string[],fn:()=>Promise<T>):Promise<T>{for(const p of paths)this.internalPaths.set(p,(this.internalPaths.get(p)||0)+1);try{return await fn();}finally{for(const p of paths){const n=this.internalPaths.get(p)!-1;if(n)this.internalPaths.set(p,n);else this.internalPaths.delete(p);}}}
   drive(){
     const drive=new Drive(this.state.settings.folderId,()=>this.token(),requestUrl,10*1024*1024,{check:()=>this.check(),progress:p=>this.setProgress(p)});
-    drive.index=this.state.driveIndex;
+    drive.index=this.state.driveIndex;drive.onUnauthorized=()=>{this.access=undefined;};
+    drive.hooks={pending:this.state.pending!,history:this.state.history!,intent:async(key,value)=>{const record:StateRecord={kind:'intent',key,value};await this.journal.record(record);applyRecord(this.state,record);},savedHistory:async(checksum,entry)=>{const record:StateRecord={kind:'history',hash:checksum,entry};await this.journal.record(record);applyRecord(this.state,record);}};
     const scan=drive.scan.bind(drive);drive.scan=async()=>{const entries=await scan();this.state.driveIndex=drive.index;await this.persist();return entries;};return drive;
   }
   async exclusive<T>(fn:()=>Promise<T>):Promise<T>{
@@ -167,15 +173,15 @@ export default class NoteBridge extends Plugin {
       for(const [path,entry] of remote)if(under(path,pair.from)||under(path,pair.to)){
         const old=review.remote.get(path);if(!old||old.id!==entry.id||old.hash!==entry.hash||old.version!==entry.version)throw new Error('Содержимое изменилось; обновите список');
       }
-      const meta=drive.folderMeta.get(pair.from)!;const stamp=await drive.treeStamp(meta.id);const targetId=drive.folders.get(pair.to)!;const targetStamp=await drive.treeStamp(targetId);
-      const latestLocal=await this.local().scan();
-      if(!duplicateFolders(latestLocal,remote,drive.folders).some(p=>p.from===pair.from&&p.to===pair.to))throw new Error('Локальные заметки изменились');
-      if(await drive.treeStamp(meta.id)!==stamp||await drive.treeStamp(targetId)!==targetStamp)throw new Error('Папка изменилась во время проверки');
-      await drive.patchChecked(meta.id,meta.version,{labels:{trashed:true}});
-      await drive.scan();
-      for(const path of Object.keys(this.state.baseline))if(under(path,pair.from))delete this.state.baseline[path];
+      // Each reviewed file is conditionally trashed. New/changed descendants are never swept up.
+      for(const [path,entry] of remote)if(under(path,pair.from)){
+        const target=pair.to+path.slice(pair.from.length),current=this.app.vault.getAbstractFileByPath(target);
+        if(!(current instanceof TFile)||await hash(await this.app.vault.readBinary(current))!==entry.hash)throw new Error('Локальная копия изменилась: '+target);
+        const kept=remote.get(target)!;await drive.read(kept);await drive.trash(entry);
+        delete this.state.baseline[path];
+      }
       this.state.renames=this.state.renames?.filter(r=>!(r.from===pair.from&&r.to===pair.to));
-      this.state.events.push({time:new Date().toISOString(),path:pair.from,action:'duplicate-to-trash',detail:'Копия сохранена: '+pair.to});await this.persist();
+      this.state.events.push({time:new Date().toISOString(),path:pair.from,action:'duplicate-to-trash',detail:'Копия сохранена: '+pair.to+'. Пустые папки оставлены для безопасной ручной уборки.'});await this.persist();
     });
   }
   async applyRenames(drive:Drive){
@@ -231,7 +237,17 @@ export default class NoteBridge extends Plugin {
     const path='Note Bridge Journal '+new Date().toISOString().replace(/[:.]/g,'-')+'.json';
     await this.app.vault.create(path,JSON.stringify({version:this.manifest.version,events:this.state.events},null,2));new Notice('Создан '+path);
   }
-  persist(){const data=JSON.parse(JSON.stringify(this.state));this.saveQueue=this.saveQueue.catch(()=>{}).then(()=>this.saveData(data));return this.saveQueue;}
+  persist(){return this.journal.snapshot(this.state);}
+  async cached(checksum:string):Promise<ArrayBuffer|undefined>{
+    const path=this.manifest.dir+'/state/blobs/'+checksum;
+    if(!await this.app.vault.adapter.exists(path))return;
+    const bytes=await this.app.vault.adapter.readBinary(path);if(await hash(bytes)===checksum)return bytes;
+  }
+  async remember(bytes:ArrayBuffer){
+    if(bytes.byteLength>1024*1024)return;
+    const checksum=await hash(bytes),path=this.manifest.dir+'/state/blobs/'+checksum;
+    if(!await this.app.vault.adapter.exists(path))await this.app.vault.adapter.writeBinary(path,bytes);
+  }
   origin(){const u=new URL(this.state.settings.workerUrl);if(u.protocol!=='https:'||u.username||u.password||u.pathname!=='/'||u.search||u.hash)throw new Error('Укажите HTTPS-адрес Worker без пути');return u.origin;}
   async broker(path:string,data?:Record<string,string>,token?:string){
     const r=await requestUrl({url:this.origin()+path,method:'POST',contentType:'application/json',body:JSON.stringify(data||{}),headers:token?{Authorization:'Bearer '+token}:{},throw:false});
@@ -282,7 +298,8 @@ export default class NoteBridge extends Plugin {
         if(f.stat.size>10*1024*1024)throw new Error('Файл больше лимита 10 МБ: '+f.path);
         let cached=this.localCache.get(f.path);
         if(!cached||cached.mtime!==f.stat.mtime||cached.size!==f.stat.size){
-          const epoch=this.cacheEpoch,mtime=f.stat.mtime,size=f.stat.size,checksum=await hash(await vault.readBinary(f));
+          const epoch=this.cacheEpoch,mtime=f.stat.mtime,size=f.stat.size,bytes=await vault.readBinary(f),checksum=await hash(bytes);
+          if(this.state.baseline[f.path]?.hash===checksum&&/\.(md|txt)$/i.test(f.path))await this.remember(bytes);
           if(f.stat.mtime!==mtime||f.stat.size!==size)throw new Error('Файл изменился во время чтения: '+f.path);
           cached={mtime,size,hash:checksum};if(epoch===this.cacheEpoch)this.localCache.set(f.path,cached);
         }
@@ -316,7 +333,7 @@ export default class NoteBridge extends Plugin {
         if(!vault.getAbstractFileByPath(target)){await mkdir(target);await vault.createBinary(target,bytes);}
       }
     };
-    return {...adapter,write:(...args)=>this.quiet(()=>adapter.write(...args)),move:(...args)=>this.quiet(()=>adapter.move!(...args)),trash:(...args)=>this.quiet(()=>adapter.trash!(...args)),conflict:(...args)=>this.quiet(()=>adapter.conflict(...args))};
+    return {...adapter,write:(...args)=>this.quiet([args[0]],()=>adapter.write(...args)),move:(...args)=>this.quiet([args[0],args[1]],()=>adapter.move!(...args)),trash:(...args)=>this.quiet([args[0]],()=>adapter.trash!(...args)),conflict:(...args)=>adapter.conflict(...args)};
   }
   async sync(dryRun=false,automatic=false){
     if(this.busy||this.stopped||document.hidden||(automatic&&(this.reviewing||!this.state.settings.autoSync||this.paused)))return;if(this.timer)window.clearTimeout(this.timer);this.lastSync=Date.now();this.dirty=false;this.busy=true;this.paused=false;this.backgrounded=false;
@@ -327,18 +344,35 @@ export default class NoteBridge extends Plugin {
       const drive=this.drive();
       if(!dryRun)await this.applyRenames(drive);
       const engine=new SyncEngine(this.local(),drive,this.state.baseline,async(base,event)=>{
-        this.state.baseline=base;this.state.binding=binding;this.state.events.push(event);this.state.events=this.state.events.slice(-500);await this.persist();
-      },{check:()=>this.check(),progress:p=>this.setProgress(p)},{local:new Set(this.state.deleted),remote:drive.deletedIds,conflicts:this.state.conflicts});
+        this.state.baseline=base;
+        const remote=drive.entryForPath(event.path);
+        const record:StateRecord={kind:'checkpoint',path:event.path,base:base[event.path]||null,event,remote,conflict:this.state.conflicts?.[event.path],binding};
+        await this.journal.record(record);
+        // In-memory index is already current. Replay updates are only needed after restart.
+        this.state.binding=binding;this.state.events.push(event);this.state.events=this.state.events.slice(-500);if(!['error','conflict','local-deletion','remote-deletion'].includes(event.action))delete this.state.operations?.[event.path];
+      },{check:()=>this.check(),progress:p=>this.setProgress(p)},{local:new Set(this.state.deleted),remote:drive.deletedIds,conflicts:this.state.conflicts,recover:async(locals,remotes,baseline)=>{
+        const recovered:string[]=[];
+        for(const [path,op] of Object.entries(this.state.operations||{})){
+          const l=locals.get(path),r=remotes.get(path);
+          if(op.action==='upload'&&op.local&&r?.hash===op.local.hash&&(op.remote?.id===r.id||Object.values(this.state.pending||{}).some(p=>p.path===path&&p.hash===r.hash&&p.id===r.id))){baseline[path]={hash:r.hash,remoteId:r.id};recovered.push(path);}
+          else if(op.action==='download'&&op.remote&&l?.hash===op.remote.hash&&r?.id===op.remote.id){baseline[path]={hash:op.remote.hash,remoteId:op.remote.id};recovered.push(path);}
+        }return recovered;
+      },cached:h=>this.cached(h),remember:b=>this.remember(b),isolateErrors:true,
+        prepare:async(path,action,l,r)=>{const record:StateRecord={kind:'operation',path,value:{id:crypto.randomUUID(),action,local:l,remote:r,time:Date.now()}};await this.journal.record(record);applyRecord(this.state,record);}});
       const events=await engine.run(dryRun);
+      if(!dryRun)this.state.events.push({time:new Date().toISOString(),path:'',action:'metrics',detail:JSON.stringify(drive.metrics)});
       this.state.deleted=this.state.deleted?.filter(p=>!!this.state.baseline[p]&&!this.app.vault.getAbstractFileByPath(p));
+      for(const [key,intent] of Object.entries(this.state.pending||{}))if(!key.startsWith('history|')&&this.state.baseline[intent.path]?.hash===intent.hash&&this.state.baseline[intent.path]?.remoteId===intent.id)delete this.state.pending![key];
+      const referenced=new Set(Object.values(this.state.baseline).map(b=>b.remoteId));if(this.state.driveIndex)this.state.driveIndex.deletedIds=this.state.driveIndex.deletedIds?.filter(id=>referenced.has(id));
       this.state.resumeSync=false;await this.persist();
-      const pending=events.filter(e=>e.action.includes('deletion')||e.action==='conflict').length;
-      this.setProgress({...this.progress,phase:pending?`Проверить: ${pending} конфликтов/удалений`:'Синхронизировано'});
-      const noticeKey=events.filter(e=>e.action==='conflict'||e.action.includes('deletion')).map(e=>e.path+'|'+e.action+'|'+this.state.conflicts?.[e.path]).sort().join('\n');
+      if(!dryRun){const keep=new Set([...Object.values(this.state.baseline).map(b=>b.hash),...Object.values(this.state.pending||{}).map(p=>p.hash)]);for(const path of (await this.app.vault.adapter.list(this.manifest.dir+'/state/blobs')).files)if(!keep.has(path.split('/').at(-1)!))await this.app.vault.adapter.remove(path).catch(()=>{});}
+      const pending=events.filter(e=>e.action.includes('deletion')||e.action==='conflict'||e.action==='error').length;
+      this.setProgress({...this.progress,phase:pending?`Требует внимания: ${pending}`:'Синхронизировано'});
+      const noticeKey=events.filter(e=>e.action==='conflict'||e.action==='error'||e.action.includes('deletion')).map(e=>e.path+'|'+e.action+'|'+this.state.conflicts?.[e.path]).sort().join('\n');
       const changedIssues=noticeKey!==this.state.noticeKey;
       if(!dryRun){this.state.noticeKey=noticeKey;await this.persist();}
       if(dryRun)new HistoryModal(this.app,events).open();
-      else if(!automatic||(pending&&changedIssues))new Notice(pending?`Note Bridge: ${pending} конфликтов/удалений: откройте «Конфликты и удаления»`:'Note Bridge: синхронизация завершена');
+      else if(!automatic||(pending&&changedIssues))new Notice(pending?`Note Bridge: ${pending} операций требуют внимания: откройте конфликты или журнал`:'Note Bridge: синхронизация завершена');
     }catch(error){
       const suspended=error instanceof Paused||this.backgrounded||document.hidden;
       const message=suspended?'Пауза. Выполненные операции сохранены.':error instanceof Error?error.message:'Неизвестная ошибка';
@@ -355,7 +389,7 @@ export default class NoteBridge extends Plugin {
 class BridgeSettings extends PluginSettingTab {
   constructor(app:App,private p:NoteBridge){super(app,p);}
   display(){
-    const el=this.containerEl;el.empty();el.createEl('h2',{text:'Note Bridge · тестовая версия 0.4.0'});
+    const el=this.containerEl;el.empty();el.createEl('h2',{text:'Note Bridge · тестовая версия 0.5.0'});
     el.createEl('p',{text:'Используйте отдельную копию хранилища. Локальные удаления передаются автоматически, если версия Drive не менялась; спорные удаления — в «Конфликты и удаления». Лимит файла — 10 МБ. Другие средства синхронизации этого хранилища должны быть отключены.'});
     new Setting(el).setName('Адрес сервиса авторизации').setDesc('https://имя.workers.dev').addText(t=>t.setValue(this.p.state.settings.workerUrl).onChange(async v=>{if(this.p.busy)return;this.p.state.settings.workerUrl=v.trim();this.p.access=undefined;await this.p.persist();}));
     new Setting(el).setName('ID папки Google Drive').setDesc('Часть адреса после /folders/. Папку создайте заранее.').addText(t=>t.setValue(this.p.state.settings.folderId).onChange(async v=>{if(this.p.busy)return;this.p.state.settings.folderId=v.trim();await this.p.persist();}));
