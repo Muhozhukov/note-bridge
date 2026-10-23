@@ -66,3 +66,33 @@ test('remote rename with local edits fails without moving or uploading',async()=
  await assert.rejects(new SyncEngine(adapter,r,b,async()=>{}).run(),/конфликтует/);assert.equal(moved,false);assert.equal(l.files.has('old.md'),true);
 });
 test('first upload creates no redundant history snapshot',async()=>{const l=new Memory({'a.md':'new'}),r=new Memory({});await new SyncEngine(local(l),r,{},async()=>{}).run();assert.equal(r.backups.length,0);assert.equal(r.files.size,1);});
+
+test('recorded local deletion trashes unchanged baseline version automatically',async()=>{
+ const l=new Memory({}),r=new Memory({'a.md':'old'}),b=await base('old');b['a.md'].remoteId='a.md';let trashed=0;
+ const remote:Remote={scan:()=>r.scan(),read:e=>r.read(e),write:(...a)=>r.write(...a),snapshot:(...a)=>r.snapshot(a[0],a[1]),trash:async()=>{trashed++;r.files.delete('a.md');}};
+ const events=await new SyncEngine(local(l),remote,b,async()=>{},{},{local:new Set(['a.md'])}).run();assert.equal(trashed,1);assert.equal(b['a.md'],undefined);assert.equal(events[0].action,'resolution-trash-remote');
+});
+test('recorded deletion conflicts with newer remote content or replaced ID',async()=>{
+ for(const changed of ['content','id']){const l=new Memory({}),r=new Memory({'a.md':changed==='content'?'new':'old'}),b=await base('old');b['a.md'].remoteId=changed==='id'?'other':'a.md';
+ const remote:Remote={scan:()=>r.scan(),read:e=>r.read(e),write:(...a)=>r.write(...a),snapshot:async()=>{},trash:async()=>{throw new Error('Must not delete');}};
+ const events=await new SyncEngine(local(l),remote,b,async()=>{},{},{local:new Set(['a.md'])}).run();assert.equal(events[0].action,'local-deletion');}
+});
+test('recreated local file prevents automatic remote deletion',async()=>{
+ const l=new Memory({}),r=new Memory({'a.md':'old'}),b=await base('old');b['a.md'].remoteId='a.md';const adapter=local(l);adapter.exists=()=>true;
+ const remote:Remote={scan:()=>r.scan(),read:e=>r.read(e),write:(...a)=>r.write(...a),snapshot:async()=>{},trash:async()=>{throw new Error('Must not delete');}};
+ await assert.rejects(new SyncEngine(adapter,remote,b,async()=>{},{},{local:new Set(['a.md'])}).run(),/появился/);
+});
+test('unchanged unresolved conflict does not upload repeated snapshots',async()=>{
+ const l=new Memory({'a.md':'local'}),r=new Memory({'a.md':'remote'});const b=await base('old'),conflicts={};
+ await new SyncEngine(local(l),r,b,async()=>{},{},{conflicts}).run();const n=r.backups.length;
+ const events=await new SyncEngine(local(l),r,b,async()=>{},{},{conflicts}).run();assert.equal(r.backups.length,n);assert.equal(events[0].action,'conflict');
+});
+
+test('explicit remote trash removes only unchanged local version and preserves a snapshot',async()=>{
+ for(const edited of [false,true]){
+ const l=new Memory({'a.md':edited?'edited':'old'}),r=new Memory({}),b=await base('old');b['a.md'].remoteId='a.md';const adapter=local(l);let removed=0;
+ adapter.trash=async(p,h)=>{assert.equal(await hash(l.files.get(p)!),h);l.files.delete(p);removed++;};
+ const events=await new SyncEngine(adapter,r,b,async()=>{},{},{remote:new Set(['a.md'])}).run();
+ assert.equal(removed,edited?0:1);assert.equal(events[0].action,edited?'remote-deletion':'resolution-trash-local');assert.equal(r.backups.length,edited?0:1);
+ }
+});

@@ -8,12 +8,16 @@ export class ResolutionModal extends Modal {
   constructor(app:App,private plugin:NoteBridge){super(app);}
   onOpen(){this.plugin.reviewing++;this.titleEl.setText('Конфликты и удаления');void this.reload();}
   onClose(){this.plugin.reviewing--;this.plugin.schedule();}
-  async reload(){
+  async reload(refresh=false){
     this.contentEl.empty();this.contentEl.createEl('p',{text:'Проверка актуальных версий…'});
     try{
-      const review=await this.plugin.review();this.contentEl.empty();
+      const review=await this.plugin.review(refresh);this.contentEl.empty();
       this.contentEl.createEl('p',{text:'Удаление из Drive переносит объект в корзину. Перед заменой версии сохраняется снимок. Если файлы изменились после проверки, действие будет остановлено.'});
-      const action=(fn:()=>Promise<void>)=>{void fn().then(()=>this.reload()).catch(e=>new Notice(String(e),12000));};
+      const action=(fn:()=>Promise<void>)=>{
+        this.contentEl.querySelectorAll('button').forEach(b=>b.disabled=true);
+        const status=this.contentEl.createEl('p',{text:'Применяем решение…',attr:{role:'status'}});
+        void fn().then(()=>{new Notice('Решение применено');return this.reload();}).catch(e=>{status.setText(String(e));this.contentEl.querySelectorAll('button').forEach(b=>b.disabled=false);});
+      };
       let count=0;
       for(const rename of this.plugin.state.renames||[]){
         count++;new Setting(this.contentEl).setName('Ожидает переименования: '+rename.from+' → '+rename.to).setDesc('Если целевая папка уже существует, сначала проверьте дубликаты ниже. Можно отменить только передачу переименования: файлы останутся на местах и будут сравниваться отдельно.').addButton(b=>b.setButtonText('Отменить передачу').onClick(()=>new ConfirmModal(this.app,'Отменить передачу переименования? Содержимое останется на обеих сторонах.',()=>action(async()=>{if(this.plugin.busy)throw new Error('Дождитесь операции');this.plugin.state.renames=this.plugin.state.renames?.filter(r=>r!==rename);await this.plugin.persist();})).open()));
@@ -35,8 +39,8 @@ export class ResolutionModal extends Modal {
         if(type==='remote-deletion')row.addButton(b=>b.setButtonText('Вернуть в Drive').onClick(()=>choose('local'))).addButton(b=>b.setButtonText('Удалить на телефоне').setWarning().onClick(()=>new ConfirmModal(this.app,'Перенести в локальную корзину: '+path,()=>choose('remote')).open()));
       }
       if(!count)this.contentEl.createEl('p',{text:'Конфликтов, ожидающих удаления и точных дубликатов папок не найдено.'});
-      new Setting(this.contentEl).addButton(b=>b.setButtonText('Обновить').onClick(()=>{void this.reload();}));
-    }catch(e){this.contentEl.empty();this.contentEl.createEl('p',{text:String(e)});new Setting(this.contentEl).addButton(b=>b.setButtonText('Повторить проверку').onClick(()=>{void this.reload();}));}
+      new Setting(this.contentEl).addButton(b=>b.setButtonText('Проверить изменения в Drive').onClick(()=>{void this.reload(true);}));
+    }catch(e){this.contentEl.empty();this.contentEl.createEl('p',{text:String(e)});new Setting(this.contentEl).addButton(b=>b.setButtonText('Повторить проверку').onClick(()=>{void this.reload(true);}));}
   }
 }
 class ConfirmModal extends Modal {

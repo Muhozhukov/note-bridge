@@ -29,7 +29,7 @@ test('hashless scan caches verified bytes instead of downloading twice',async()=
   if(p.url.includes('pageSize'))return response({files:[{id:'f',name:'Ремонт квартиры.md',version:'1',mimeType:'text/markdown',size:'4'}]});
   return response(p.url.includes('/folder?')?{mimeType:'application/vnd.google-apps.folder'}:{version:'1',size:'4'});
  });
- const scan=await d.scan();await d.read(scan.get('Ремонт квартиры.md')!);assert.equal(media,1);
+ const scan=await d.fullScan();await d.read(scan.get('Ремонт квартиры.md')!);assert.equal(media,1);
 });
 test('folder rename patches title with ETag and never uploads contents',async()=>{
  const calls:RequestUrlParam[]=[];const d=new Drive('root-folder',async()=>'token',async p=>{calls.push(p);if(p.url.includes('pageSize'))return response({files:[]});if(p.method==='PATCH')return response({id:'old-id',version:'2'});return response({id:'old-id',version:'1',etag:'"v1"'});});

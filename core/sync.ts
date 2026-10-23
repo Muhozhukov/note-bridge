@@ -21,6 +21,7 @@ export type Baseline = Record<string, {hash: string; remoteId?: string}>;
 export type Event = { time: string; path: string; action: string; detail?: string };
 export interface Local {
   scan(): Promise<Map<string,Entry>>;
+  exists?(path:string):boolean;
   read(path: string): Promise<ArrayBuffer>;
   /** Implementations must reject if the current hash differs from expected. */
   write(path: string, bytes: ArrayBuffer, expected?: string): Promise<void>;
@@ -33,12 +34,13 @@ export interface Remote {
   read(entry: Entry): Promise<ArrayBuffer>;
   /** Must conditionally update or fail closed; creates must detect duplicate paths. */
   write(path: string, bytes: ArrayBuffer, expected?: Entry): Promise<Entry>;
+  trash?(entry:Entry):Promise<void>;
   snapshot(path: string, bytes: ArrayBuffer, source: string): Promise<void>;
 }
 export class SyncEngine {
   running = false;
   constructor(private local: Local, private remote: Remote, public baseline: Baseline,
-    private checkpoint: (base: Baseline, event: Event)=>Promise<void>, private control:Control={}) {}
+    private checkpoint: (base: Baseline, event: Event)=>Promise<void>, private control:Control={}, private deletions:{local?:Set<string>;remote?:Set<string>;conflicts?:Record<string,string>}={}) {}
   async run(dryRun = false): Promise<Event[]> {
     if (this.running) throw new Error('Синхронизация уже выполняется');
     this.running = true;
@@ -99,7 +101,14 @@ export class SyncEngine {
           return;
         }
         if (action==='local-deletion'||action==='remote-deletion') {
-          // Alpha deliberately requires manual review of deletions and renames.
+          if(action==='local-deletion'&&r&&r.hash===b?.hash&&r.id===b.remoteId&&this.deletions.local?.has(path)&&this.remote.trash){
+            if(this.local.exists?.(path))throw new Error('Локальный файл появился перед удалением: '+path);
+            await this.remote.trash(r);delete this.baseline[path];await emit(path,'resolution-trash-remote','Удаление передано автоматически: версия Drive не менялась');advance();return;
+          }
+          if(action==='remote-deletion'&&l&&l.hash===b?.hash&&b.remoteId&&this.deletions.remote?.has(b.remoteId)&&this.local.trash){
+            await this.remote.snapshot(path,await this.local.read(path),'local-before-delete');await this.local.trash(path,l.hash);delete this.baseline[path];await emit(path,'resolution-trash-local','Удаление передано автоматически: локальная версия не менялась');advance();return;
+          }
+          // Unknown absence or concurrent edit needs explicit review.
           await emit(path,action,'Удаление не распространено; требуется проверка.'); advance(); return;
         }
         if (action==='upload') {
@@ -111,12 +120,15 @@ export class SyncEngine {
           const result=await this.remote.write(path,bytes,r);
           this.baseline[path]={hash:l!.hash,remoteId:result.id};
         } else {
+          const fingerprint=l?.hash+'|'+r?.id+'|'+r?.hash;
+          if(action==='conflict'&&this.deletions.conflicts?.[path]===fingerprint){await emit(path,action,'Ожидает решения; версии не изменились');advance();return;}
           const bytes=await this.remote.read(r!);
           if(await hash(bytes)!==r!.hash) throw new Error('Удалённый файл изменился: '+path);
           if(action==='conflict') {
             await this.remote.snapshot(path,bytes,'remote-conflict');
             await this.remote.snapshot(path,await this.local.read(path),'local-conflict');
             await this.local.conflict(path,bytes,r!.hash);
+            if(this.deletions.conflicts)this.deletions.conflicts[path]=fingerprint;
             await emit(path,action,'Локальный оригинал сохранён; удалённая версия в Note Bridge Conflicts.');
             advance(); return; // Do not advance baseline until the user resolves the conflict.
           }
