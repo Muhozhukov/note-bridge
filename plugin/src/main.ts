@@ -1,4 +1,5 @@
 import {BridgeModal} from './modal';
+import {formatDriveMetrics} from '../../core/event-format';
 import {Journal} from '../../core/journal';
 import {LocalIndex} from '../../core/local-index';
 import {PerformanceRun,type Outcome} from '../../core/performance';
@@ -16,7 +17,7 @@ import {applyRecord,defaults,type Saved,type StateRecord} from './state';
 class HistoryModal extends BridgeModal {
   constructor(app:App,private events:Event[]){super(app);}
   onOpen(){this.titleEl.setText('Note Bridge — журнал');this.contentEl.createEl('p',{text:'Журнал этого устройства. Снимки файлов сохраняются в служебной папке .note-bridge-history в Google Drive. Автоматический откат пока не реализован.'});
-    new Setting(this.contentEl).addButton(b=>b.setButtonText('Скопировать журнал').onClick(()=>{void navigator.clipboard.writeText(JSON.stringify({version:'0.6.1',events:this.events},null,2)).then(()=>new Notice('Журнал скопирован')).catch(()=>new Notice('Копирование недоступно; используйте экспорт из настроек.'));}));
+    new Setting(this.contentEl).addButton(b=>b.setButtonText('Скопировать журнал').onClick(()=>{void navigator.clipboard.writeText(JSON.stringify({version:'0.6.2',events:this.events},null,2)).then(()=>new Notice('Журнал скопирован')).catch(()=>new Notice('Копирование недоступно; используйте экспорт из настроек.'));}));
     const labels:Record<string,string>={upload:'Отправлено в Google Drive',download:'Скачано на устройство',conflict:'Нужно объединить изменения','local-deletion':'Удалено на телефоне — ожидает решения','remote-deletion':'Удалено в Drive — ожидает решения','duplicate-to-trash':'Дубликат перенесён в корзину',resolved:'Конфликт разрешён','resolution-trash-local':'Файл перенесён в локальную корзину','resolution-trash-remote':'Файл перенесён в корзину Drive',metrics:'Статистика запросов Drive',merged:'Изменения объединены',recovered:'Прерванная операция подтверждена',rename:'Переименовано',complete:'Синхронизация завершена',paused:'Синхронизация приостановлена',error:'Ошибка синхронизации'};
     const list=this.contentEl.createDiv();
     const render=(onlyIssues:boolean)=>{list.empty();const events=this.events.slice(-100).reverse().filter(e=>!onlyIssues||['conflict','local-deletion','remote-deletion','duplicate-to-trash','resolved','merged','error','resolution-trash-local','resolution-trash-remote'].includes(e.action));
@@ -24,7 +25,8 @@ class HistoryModal extends BridgeModal {
       for(const e of events){const card=list.createDiv({cls:'nb-conflict-card'+(e.action.includes('deletion')||e.action.includes('trash')?' nb-danger-card':'')});
         card.createEl('strong',{text:labels[e.action]||e.action});card.createEl('div',{text:new Date(e.time).toLocaleString('ru-RU'),cls:'nb-event-time'});
         if(e.path)card.createEl('div',{text:e.path,cls:'nb-path'});
-        if(e.detail)card.createEl('p',{text:e.action==='resolved'?(e.detail==='local'?'Выбрано состояние телефона':'Выбрано состояние Google Drive'):e.action==='rename'?'Предыдущий путь: '+e.detail:e.detail});
+        if(e.action==='metrics'&&e.detail)for(const text of formatDriveMetrics(e.detail))card.createEl('p',{text});
+        else if(e.detail)card.createEl('p',{text:e.action==='resolved'?(e.detail==='local'?'Выбрано состояние телефона':'Выбрано состояние Google Drive'):e.action==='rename'?'Предыдущий путь: '+e.detail:e.detail});
       }
     };
     new Setting(this.contentEl).setName('Только конфликты, удаления и ошибки').addToggle(t=>t.setValue(true).onChange(render));render(true);
@@ -443,7 +445,7 @@ export default class NoteBridge extends Plugin {
 class BridgeSettings extends PluginSettingTab {
   constructor(app:App,private p:NoteBridge){super(app,p);}
   display(){
-    const el=this.containerEl;el.empty();el.createEl('h2',{text:'Note Bridge · тестовая версия 0.6.1'});
+    const el=this.containerEl;el.empty();el.createEl('h2',{text:'Note Bridge · тестовая версия 0.6.2'});
     el.createEl('p',{text:'Используйте отдельную копию хранилища. Локальные удаления передаются автоматически, если версия Drive не менялась; спорные удаления — в «Конфликты и удаления». Лимит файла — 10 МБ. Другие средства синхронизации этого хранилища должны быть отключены.'});
     new Setting(el).setName('Адрес сервиса авторизации').setDesc('https://имя.workers.dev').addText(t=>t.setValue(this.p.state.settings.workerUrl).onChange(async v=>{if(this.p.busy)return;this.p.state.settings.workerUrl=v.trim();this.p.access=undefined;await this.p.persist();}));
     new Setting(el).setName('ID папки Google Drive').setDesc('Часть адреса после /folders/. Папку создайте заранее.').addText(t=>t.setValue(this.p.state.settings.folderId).onChange(async v=>{if(this.p.busy)return;this.p.state.settings.folderId=v.trim();await this.p.persist();}));

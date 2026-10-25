@@ -14,6 +14,9 @@
 .nb-merge-editor { width:100%; min-height:45vh; resize:vertical; font-family:var(--font-monospace); }
 .nb-conflict-card .setting-item { flex-wrap:wrap; gap:10px; }
 .nb-conflict-card .setting-item-control { flex-wrap:wrap; }
+.nb-modal .modal-content { min-width:0; overflow-x:hidden; }
+.nb-modal .nb-conflict-card { min-width:0; max-width:100%; box-sizing:border-box; overflow-wrap:anywhere; white-space:normal; }
+.nb-modal .nb-conflict-card p,.nb-modal .nb-conflict-card strong,.nb-modal .nb-path { white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
 /* Only Note Bridge dialogs become bottom sheets on mobile. */
 body.is-mobile .nb-modal-container {
   align-items:flex-end;
