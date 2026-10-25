@@ -1,3 +1,4 @@
+import {BridgeModal} from './modal';
 import {Journal} from '../../core/journal';
 import {LocalIndex} from '../../core/local-index';
 import {PerformanceRun,type Outcome} from '../../core/performance';
@@ -5,17 +6,17 @@ import {PerformanceLog} from '../../core/performance-log';
 import {autosyncDelay} from '../../core/scheduling';
 import {mergeVersions} from '../../core/merge';
 import {ResolutionModal,type Review} from './resolution';
-import {under,remapBaseline,duplicateFolders,type Rename} from '../../core/changes';
+import {compactRenames,under,remapBaseline,duplicateFolders,type Rename} from '../../core/changes';
 import {Paused,type Progress} from '../../core/control';
 import {Plugin,PluginSettingTab,Setting,Notice,Modal,TFile,TFolder,Platform,requestUrl,setIcon,type App} from 'obsidian';
 import {SyncEngine,hash,validPath,type Baseline,type Event,type Local,type Entry} from '../../core/sync';
 import {Drive,type DriveIndex,type WriteIntent} from './drive';
 import {random,digest} from '../../auth-service/src/crypto';
 import {applyRecord,defaults,type Saved,type StateRecord} from './state';
-class HistoryModal extends Modal {
+class HistoryModal extends BridgeModal {
   constructor(app:App,private events:Event[]){super(app);}
   onOpen(){this.titleEl.setText('Note Bridge — журнал');this.contentEl.createEl('p',{text:'Журнал этого устройства. Снимки файлов сохраняются в служебной папке .note-bridge-history в Google Drive. Автоматический откат пока не реализован.'});
-    new Setting(this.contentEl).addButton(b=>b.setButtonText('Скопировать журнал').onClick(()=>{void navigator.clipboard.writeText(JSON.stringify({version:'0.6.0',events:this.events},null,2)).then(()=>new Notice('Журнал скопирован')).catch(()=>new Notice('Копирование недоступно; используйте экспорт из настроек.'));}));
+    new Setting(this.contentEl).addButton(b=>b.setButtonText('Скопировать журнал').onClick(()=>{void navigator.clipboard.writeText(JSON.stringify({version:'0.6.1',events:this.events},null,2)).then(()=>new Notice('Журнал скопирован')).catch(()=>new Notice('Копирование недоступно; используйте экспорт из настроек.'));}));
     const labels:Record<string,string>={upload:'Отправлено в Google Drive',download:'Скачано на устройство',conflict:'Нужно объединить изменения','local-deletion':'Удалено на телефоне — ожидает решения','remote-deletion':'Удалено в Drive — ожидает решения','duplicate-to-trash':'Дубликат перенесён в корзину',resolved:'Конфликт разрешён','resolution-trash-local':'Файл перенесён в локальную корзину','resolution-trash-remote':'Файл перенесён в корзину Drive',metrics:'Статистика запросов Drive',merged:'Изменения объединены',recovered:'Прерванная операция подтверждена',rename:'Переименовано',complete:'Синхронизация завершена',paused:'Синхронизация приостановлена',error:'Ошибка синхронизации'};
     const list=this.contentEl.createDiv();
     const render=(onlyIssues:boolean)=>{list.empty();const events=this.events.slice(-100).reverse().filter(e=>!onlyIssues||['conflict','local-deletion','remote-deletion','duplicate-to-trash','resolved','merged','error','resolution-trash-local','resolution-trash-remote'].includes(e.action));
@@ -30,7 +31,7 @@ class HistoryModal extends Modal {
     this.contentEl.createEl('p',{text:'Это история событий, а не список нерешённых конфликтов. Актуальные действия доступны в «Конфликты и удаления».'});}
 
 }
-class ProgressModal extends Modal {
+class ProgressModal extends BridgeModal {
   private render=()=>{
     this.contentEl.empty();const p=this.plugin.progress;
     this.titleEl.setText('Note Bridge');
@@ -195,24 +196,34 @@ export default class NoteBridge extends Plugin {
     });
   }
   async applyRenames(drive:Drive){
+    const before=this.state.renames?.length||0;
+    this.state.renames=compactRenames(this.state.renames||[]);
+    this.telemetry?.count('rename_notifications',before);
+    this.telemetry?.count('rename_coalesced',before-this.state.renames.length);
+    let entries:Map<string,Entry>|undefined;
     while(this.state.renames?.length){
       this.check();const rename=this.state.renames[0];
       if(rename.from===rename.to){this.state.renames.shift();await this.persist();continue;}
-      const entries=await drive.scan();
+      entries??=await drive.scan();
       const source=rename.folder?drive.folderMeta.get(rename.from):entries.get(rename.from);
       if(!source&&!rename.id&&!Object.keys(this.state.baseline).some(p=>under(p,rename.from))){this.state.renames.shift();await this.persist();continue;}
       if(this.app.vault.getAbstractFileByPath(rename.from))throw new Error('Старый локальный путь снова существует: '+rename.from);
       if(!this.app.vault.getAbstractFileByPath(rename.to))throw new Error('Цель переименования исчезла: '+rename.to);
       if(!rename.id&&source){
         const known=Object.entries(this.state.baseline).filter(([p,b])=>under(p,rename.from)&&b.remoteId);
-        if(!known.some(([p,b])=>entries.get(p)?.id===b.remoteId))throw new Error('Нет общей истории для переименования: '+rename.from+'. Откройте «Конфликты и удаления».');
+        if(!known.some(([p,b])=>entries!.get(p)?.id===b.remoteId))throw new Error('Нет общей истории для переименования: '+rename.from+'. Откройте «Конфликты и удаления».');
         if(!rename.folder&&this.state.baseline[rename.from]?.remoteId!==source.id)throw new Error('Файл Drive был заменён');
         rename.id=source.id;await this.persist();
       }
       // Validate baseline remapping before changing the remote object.
       const next={...this.state.baseline};remapBaseline(next,rename.from,rename.to);
       await drive.rename(rename.from,rename.to,rename.folder,entries,rename.id);
-      this.state.baseline=next;this.state.renames.shift();await this.persist();
+      this.state.baseline=next;this.state.renames.shift();
+      if(rename.folder)for(const pending of this.state.renames){
+        if(under(pending.from,rename.from))pending.from=rename.to+pending.from.slice(rename.from.length);
+        if(under(pending.to,rename.from))pending.to=rename.to+pending.to.slice(rename.from.length);
+      }
+      this.telemetry?.count('rename_applied');await this.persist();entries=undefined;
     }
   }
   onunload(){this.stopped=true;if(this.timer)window.clearTimeout(this.timer);this.access=undefined;this.pending=undefined;}
@@ -257,7 +268,7 @@ export default class NoteBridge extends Plugin {
   }
   async showPerformance(){
     try{
-      const {runs,unreadable}=await this.performanceLog.read(this.telemetry?.runId),modal=new Modal(this.app);modal.titleEl.setText('Note Bridge — скорость синхронизации');
+      const {runs,unreadable}=await this.performanceLog.read(this.telemetry?.runId),modal=new BridgeModal(this.app);modal.titleEl.setText('Note Bridge — скорость синхронизации');
       modal.contentEl.createEl('p',{text:'Последние 200 циклов. Показатели локальные; названия и содержимое заметок, токены и ID Drive не записываются. Этапы могут перекрываться.'});
       for(const run of runs.slice(-10).reverse()){
         const card=modal.contentEl.createDiv({cls:'nb-conflict-card'});card.createEl('strong',{text:new Date(run.startedAt).toLocaleString('ru-RU')+' · '+({success:'Готово',issues:'Есть замечания',paused:'Пауза',error:'Ошибка',interrupted:'Прервано',running:'Выполняется'}[run.outcome])});
@@ -432,7 +443,7 @@ export default class NoteBridge extends Plugin {
 class BridgeSettings extends PluginSettingTab {
   constructor(app:App,private p:NoteBridge){super(app,p);}
   display(){
-    const el=this.containerEl;el.empty();el.createEl('h2',{text:'Note Bridge · тестовая версия 0.6.0'});
+    const el=this.containerEl;el.empty();el.createEl('h2',{text:'Note Bridge · тестовая версия 0.6.1'});
     el.createEl('p',{text:'Используйте отдельную копию хранилища. Локальные удаления передаются автоматически, если версия Drive не менялась; спорные удаления — в «Конфликты и удаления». Лимит файла — 10 МБ. Другие средства синхронизации этого хранилища должны быть отключены.'});
     new Setting(el).setName('Адрес сервиса авторизации').setDesc('https://имя.workers.dev').addText(t=>t.setValue(this.p.state.settings.workerUrl).onChange(async v=>{if(this.p.busy)return;this.p.state.settings.workerUrl=v.trim();this.p.access=undefined;await this.p.persist();}));
     new Setting(el).setName('ID папки Google Drive').setDesc('Часть адреса после /folders/. Папку создайте заранее.').addText(t=>t.setValue(this.p.state.settings.folderId).onChange(async v=>{if(this.p.busy)return;this.p.state.settings.folderId=v.trim();await this.p.persist();}));

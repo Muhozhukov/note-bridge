@@ -1,10 +1,11 @@
+import {BridgeModal} from './modal';
 import {MergeModal} from './merge';
 import {Modal,Setting,Notice,type App} from 'obsidian';
 import type NoteBridge from './main';
 import {decide,type Entry} from '../../core/sync';
 import {duplicateFolders} from '../../core/changes';
 export type Review={local:Map<string,Entry>;remote:Map<string,Entry>;folders:Map<string,string>};
-export class ResolutionModal extends Modal {
+export class ResolutionModal extends BridgeModal {
   constructor(app:App,private plugin:NoteBridge){super(app);}
   onOpen(){this.plugin.reviewing++;this.titleEl.setText('Конфликты и удаления');void this.reload();}
   onClose(){this.plugin.reviewing--;this.plugin.schedule();}
@@ -43,7 +44,7 @@ export class ResolutionModal extends Modal {
     }catch(e){this.contentEl.empty();this.contentEl.createEl('p',{text:String(e)});new Setting(this.contentEl).addButton(b=>b.setButtonText('Повторить проверку').onClick(()=>{void this.reload(true);}));}
   }
 }
-class ConfirmModal extends Modal {
+class ConfirmModal extends BridgeModal {
  constructor(app:App,private message:string,private confirm:()=>void){super(app);}
  onOpen(){this.titleEl.setText('Подтверждение');this.contentEl.addClass('nb-danger-card');this.contentEl.createEl('p',{text:this.message});new Setting(this.contentEl).addButton(b=>b.setButtonText('Отмена').onClick(()=>this.close())).addButton(b=>b.setButtonText('Подтвердить').setWarning().onClick(()=>{this.close();this.confirm();}));}
 }

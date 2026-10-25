@@ -1,6 +1,10 @@
 import type {Baseline,Entry} from './sync';
 export type Rename={from:string;to:string;folder:boolean};
 export const under=(path:string,root:string)=>path===root||path.startsWith(root+'/');
+/** Child path notifications of the same folder move are not independent moves. */
+export function compactRenames<T extends Rename>(queue:T[]):T[]{
+  return queue.filter((r,i)=>!queue.some((parent,j)=>i!==j&&parent.folder&&r.from!==parent.from&&under(r.from,parent.from)&&r.to===parent.to+r.from.slice(parent.from.length)));
+}
 export function remapBaseline(base:Baseline,from:string,to:string){
   const moves=Object.keys(base).filter(p=>under(p,from));
   for(const p of moves){const target=to+p.slice(from.length);if(base[target]&&!under(target,from))throw new Error('История нового пути уже существует: '+target);}

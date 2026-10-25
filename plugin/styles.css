@@ -14,3 +14,30 @@
 .nb-merge-editor { width:100%; min-height:45vh; resize:vertical; font-family:var(--font-monospace); }
 .nb-conflict-card .setting-item { flex-wrap:wrap; gap:10px; }
 .nb-conflict-card .setting-item-control { flex-wrap:wrap; }
+/* Only Note Bridge dialogs become bottom sheets on mobile. */
+body.is-mobile .nb-modal-container {
+  align-items:flex-end;
+  padding: max(16px, env(safe-area-inset-top)) 0 0;
+}
+body.is-mobile .nb-modal-container .nb-modal {
+  position:relative;
+  top:auto;
+  left:auto;
+  transform:none;
+  margin:0;
+  width:100%;
+  max-width:100%;
+  min-height:0;
+  height:auto;
+  max-height:calc(100dvh - max(24px, env(safe-area-inset-top)));
+  border-radius:20px 20px 0 0;
+  padding:24px max(16px, env(safe-area-inset-right)) max(20px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  overflow:hidden;
+  display:flex;
+  flex-direction:column;
+  animation:nb-sheet-in 180ms ease-out;
+}
+body.is-mobile .nb-modal .modal-content { overflow-y:auto; overscroll-behavior:contain; min-height:0; }
+body.is-mobile .nb-modal .modal-title { padding-right:32px; overflow-wrap:anywhere; }
+@keyframes nb-sheet-in { from { transform:translateY(40px); opacity:0; } to { transform:translateY(0); opacity:1; } }
+@media (prefers-reduced-motion:reduce) { body.is-mobile .nb-modal-container .nb-modal { animation:none; } }

@@ -1,8 +1,9 @@
+import {BridgeModal} from './modal';
 import {Modal,Setting,Notice,type App} from 'obsidian';
 import {compare,assemble,type Part} from '../../core/diff';
 import type NoteBridge from './main';
 import type {Review} from './resolution';
-export class MergeModal extends Modal {
+export class MergeModal extends BridgeModal {
  private parts:Part[]=[];private choices=new Map<number,'local'|'remote'>();private closed=false;
  constructor(app:App,private plugin:NoteBridge,private path:string,private review:Review,private done:()=>void){super(app);}
  onOpen(){this.plugin.reviewing++;this.titleEl.setText('Сравнение: '+this.path);void this.load();}
@@ -35,7 +36,7 @@ export class MergeModal extends Modal {
   }));
  }
 }
-class ResultModal extends Modal {
+class ResultModal extends BridgeModal {
  private saving=false;
  constructor(app:App,private plugin:NoteBridge,private path:string,private review:Review,private result:string,private done:()=>void){super(app);}
  onOpen(){
