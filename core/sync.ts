@@ -1,6 +1,7 @@
 import {threeWay} from './three-way';
 import {Paused,StorageFailure} from './control';
 import {pool,type Control} from './control';
+import type {PerformanceRun} from './performance';
 export type Action = 'none' | 'upload' | 'download' | 'conflict' | 'local-deletion' | 'remote-deletion';
 /** Absence is not deletion unless a baseline exists. Never compare wall-clock dates. */
 export function decide(base: string | undefined, local: string | undefined, remote: string | undefined): Action {
@@ -39,7 +40,7 @@ export interface Remote {
   trash?(entry:Entry):Promise<void>;
   snapshot(path: string, bytes: ArrayBuffer, source: string): Promise<void>;
 }
-export type SyncOptions={recover?:(locals:Map<string,Entry>,remotes:Map<string,Entry>,baseline:Baseline)=>Promise<string[]>;local?:Set<string>;remote?:Set<string>;conflicts?:Record<string,string>;cached?:(hash:string)=>Promise<ArrayBuffer|undefined>;remember?:(bytes:ArrayBuffer)=>Promise<void>;prepare?:(path:string,action:Action,l?:Entry,r?:Entry)=>Promise<void>;isolateErrors?:boolean};
+export type SyncOptions={performance?:PerformanceRun;recover?:(locals:Map<string,Entry>,remotes:Map<string,Entry>,baseline:Baseline)=>Promise<string[]>;local?:Set<string>;remote?:Set<string>;conflicts?:Record<string,string>;cached?:(hash:string)=>Promise<ArrayBuffer|undefined>;remember?:(bytes:ArrayBuffer)=>Promise<void>;prepare?:(path:string,action:Action,l?:Entry,r?:Entry)=>Promise<void>;isolateErrors?:boolean};
 export class SyncEngine {
   running = false;
   constructor(private local: Local, private remote: Remote, public baseline: Baseline,
@@ -94,6 +95,7 @@ export class SyncEngine {
       this.control.progress?.({phase:'Синхронизация',done,total});
       const work=async(path:string)=>{
         this.control.check?.();
+        let contentBytes=0;
         const l=locals.get(path), r=remotes.get(path), b=this.baseline[path];
         const action=decide(b?.hash,l?.hash,r?.hash);
         if(action!=='none')this.control.progress?.({phase:dryRun?'Предпросмотр':'Синхронизация',done,total,path});
@@ -118,6 +120,7 @@ export class SyncEngine {
         }
         if (action==='upload') {
           const bytes=await this.local.read(path);
+          contentBytes=bytes.byteLength;
           if(await hash(bytes)!==l!.hash) throw new Error('Локальный файл изменился во время синка: '+path);
           // First upload already creates a durable copy; snapshot only before overwrite.
           if(r){const old=await this.deletions.cached?.(r.hash)||await this.remote.read(r);await this.remote.snapshot(path,old,'remote-before-upload');}
@@ -128,6 +131,7 @@ export class SyncEngine {
           const fingerprint=l?.hash+'|'+r?.id+'|'+r?.hash;
           if(action==='conflict'&&this.deletions.conflicts?.[path]===fingerprint){await emit(path,action,'Ожидает решения; версии не изменились');advance();return;}
           const bytes=await this.remote.read(r!);
+          if(action==='download')contentBytes=bytes.byteLength;
           if(await hash(bytes)!==r!.hash) throw new Error('Удалённый файл изменился: '+path);
           if(action==='conflict'&&b&&/\.(md|txt)$/i.test(path)&&this.deletions.cached){
             const base=await this.deletions.cached(b.hash),localBytes=await this.local.read(path);
@@ -154,11 +158,13 @@ export class SyncEngine {
           await this.deletions.remember?.(bytes);
           this.baseline[path]={hash:r!.hash,remoteId:r!.id};
         }
-        await emit(path,action); advance();
+        await emit(path,action); advance();return contentBytes;
       };
       const planned=paths.filter(path=>decide(this.baseline[path]?.hash,locals.get(path)?.hash,remotes.get(path)?.hash)!=='none'||this.baseline[path]?.remoteId!==remotes.get(path)?.id||this.baseline[path]?.hash!==locals.get(path)?.hash||(!locals.has(path)&&!!this.baseline[path]));
+      this.deletions.performance?.count('planned_files',planned.length);
       await pool(planned,async path=>{
-        try{await work(path);}catch(e){
+        const action=decide(this.baseline[path]?.hash,locals.get(path)?.hash,remotes.get(path)?.hash);
+        try{if(this.deletions.performance)await this.deletions.performance.measure('operation_'+action,()=>work(path),bytes=>bytes||0);else await work(path);}catch(e){
           if(!this.deletions.isolateErrors||e instanceof Paused||e instanceof StorageFailure||/журнал|HTTP (401|403|429|5\d\d)|timeout|timed out|network|fetch/i.test(String(e)))throw e;
           await emit(path,'error',String(e));
         }

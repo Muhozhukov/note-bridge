@@ -1,6 +1,7 @@
 import {retryRead,type Control} from '../../core/control';
 import type {RequestUrlParam, RequestUrlResponse} from 'obsidian';
 import {hash,validPath,type Remote,type Entry} from '../../core/sync';
+import type {PerformanceRun} from '../../core/performance';
 export const HISTORY='.note-bridge-history';
 const API='https://www.googleapis.com/drive/v3/files';
 const FOLDER='application/vnd.google-apps.folder';
@@ -14,6 +15,7 @@ export type DriveHooks={pending:Record<string,WriteIntent>;history:Record<string
 export class Drive implements Remote {
   hooks?:DriveHooks;
   onUnauthorized?:()=>void;
+  telemetry?:PerformanceRun;
   metrics={requests:0,readBytes:0,writeBytes:0,elapsedMs:0};
   private entriesRef?:Entry[];private entriesById=new Map<string,Entry>();
   private positions=new Map<string,number>();private paths=new Map<string,Entry>();
@@ -32,12 +34,14 @@ export class Drive implements Remote {
   async scan():Promise<Map<string,Entry>> {
     const previous=this.index;
     if(!previous||previous.root!==this.root)return this.rebuild();
+    this.telemetry?.count('drive_incremental_checks');
     const changes=new Map<string,{fileId:string;removed?:boolean;file?:FileMeta}>();
     let token=previous.token,nextToken='';
     do {
       const q=new URLSearchParams({pageToken:token,pageSize:'1000',spaces:'drive',includeRemoved:'true',fields:`nextPageToken,newStartPageToken,changes(fileId,removed,file(${fields}))`});
       let response;try{response=await this.req({url:'https://www.googleapis.com/drive/v3/changes?'+q});}catch(e){if(String(e).includes('HTTP 410'))return this.rebuild();throw e;}
       const data=response.json;if(!Array.isArray(data.changes))throw new Error('Неполная лента изменений Drive');
+      this.telemetry?.count('drive_change_pages');this.telemetry?.count('drive_changes_received',data.changes.length);
       for(const change of data.changes)changes.set(change.fileId,change);
       token=data.nextPageToken||'';if(!token)nextToken=data.newStartPageToken||'';
     }while(token);
@@ -77,7 +81,7 @@ export class Drive implements Remote {
         if(f.mimeType===FOLDER){folders.set(path,f.id);folderMeta.set(path,f);await walk(f.id,path,depth+1,fresh||!folderIds.has(f.id));continue;}
         if(f.mimeType.startsWith('application/vnd.google-apps.')||Number(f.size)>this.maxBytes)throw new Error('Неподдерживаемый файл Drive: '+path);
         const old=oldEntries.get(f.id),entry:Entry={path,id:f.id,version:f.version,hash:f.sha256Checksum||(old?.version===f.version?old.hash:'')};
-        if(!entry.hash){const bytes=await this.download(entry);entry.hash=await hash(bytes);if(this.cachedBytes+bytes.byteLength<=20*1024*1024){this.cache.set(entry.id!+'|'+entry.version,bytes);this.cachedBytes+=bytes.byteLength;}}
+        if(!entry.hash){const bytes=await this.download(entry,'index_content_download');entry.hash=await hash(bytes);if(this.cachedBytes+bytes.byteLength<=20*1024*1024){this.cache.set(entry.id!+'|'+entry.version,bytes);this.cachedBytes+=bytes.byteLength;}}
         deleted.delete(f.id);output.set(path,entry);
       }
     };
@@ -88,6 +92,7 @@ export class Drive implements Remote {
     return output;
   }
   async rebuild():Promise<Map<string,Entry>> {
+    this.telemetry?.count('drive_full_rebuilds');
     const token=(await this.req({url:'https://www.googleapis.com/drive/v3/changes/startPageToken'})).json.startPageToken;
     if(!token)throw new Error('Drive не вернул начальный курсор');
     const output=await this.fullScan();
@@ -108,18 +113,28 @@ export class Drive implements Remote {
     while(!this.ids.length){if(!this.idRequest)this.idRequest=(async()=>{const ids=(await this.req({url:API+'/generateIds?count=32&space=drive&type=files'})).json.ids;if(!Array.isArray(ids)||!ids.length)throw new Error('Drive не вернул ID операций');this.ids.push(...ids);})().finally(()=>{this.idRequest=undefined;});await this.idRequest;}
     return this.ids.pop()!;
   }
-  async req(params:RequestUrlParam):Promise<RequestUrlResponse> {
-    let refreshed=false;
+  async req(params:RequestUrlParam,category='drive_metadata',transferBytes?:number):Promise<RequestUrlResponse> {
+    let refreshed=false,attempts=0;
     const execute=async():Promise<RequestUrlResponse>=>{
       this.control.check?.();
-      const started=Date.now();this.metrics.requests++;if(params.body)this.metrics.writeBytes+=typeof params.body==='string'?new TextEncoder().encode(params.body).byteLength:params.body.byteLength;
-      const response=await this.transport({...params,headers:{...params.headers,Authorization:'Bearer '+await this.getToken()},throw:false});
-      this.metrics.elapsedMs+=Date.now()-started;this.metrics.readBytes+=response.arrayBuffer?.byteLength||0;
+      const token=this.telemetry?await this.telemetry.measure('authorization',()=>this.getToken()):await this.getToken();
+      this.control.check?.();if(attempts++)this.telemetry?.count('request_retries');
+      const started=performance.now(),end=this.telemetry?.begin(category),bodyBytes=params.body?(typeof params.body==='string'?new TextEncoder().encode(params.body).byteLength:params.body.byteLength):0;
+      this.metrics.requests++;this.metrics.writeBytes+=bodyBytes;this.telemetry?.count('http_requests');
+      let response:RequestUrlResponse,success=false,received=0;
+      try{
+        response=await this.transport({...params,headers:{...params.headers,Authorization:'Bearer '+token},throw:false});
+        received=response.arrayBuffer?.byteLength||0;this.metrics.readBytes+=received;success=response.status>=200&&response.status<400;
+        this.telemetry?.count('http_status_'+response.status);
+      }finally{
+        this.metrics.elapsedMs+=performance.now()-started;end?.(success,transferBytes??received,transferBytes??(bodyBytes||received));
+      }
       if(response.status===401&&!refreshed&&this.onUnauthorized){refreshed=true;this.onUnauthorized();return execute();}
       if(response.status>=400){let reason='';try{reason=response.json?.error?.errors?.[0]?.reason||'';}catch{}throw new Error('Drive HTTP '+response.status+' '+reason+(response.status===412?' — файл изменился, повторите синк':''));}
       return response;
     };
-    return (!params.method||params.method==='GET')?retryRead(execute,()=>this.control.check?.()):execute();
+    const delay=(ms:number)=>{const wait=()=>new Promise<void>(resolve=>setTimeout(resolve,ms));return this.telemetry?this.telemetry.measure('retry_wait',wait):wait();};
+    return (!params.method||params.method==='GET')?retryRead(execute,()=>this.control.check?.(),delay):execute();
   }
 
   async meta(id:string){return this.req({url:API+'/'+encodeURIComponent(id)+'?fields='+fields});}
@@ -130,6 +145,7 @@ export class Drive implements Remote {
       const response=await this.req({url:API+'?'+q});
       const result=response.json as {nextPageToken?:string;incompleteSearch?:boolean;files:FileMeta[]};
       if(result.incompleteSearch||!Array.isArray(result.files))throw new Error('Неполный ответ Drive; синк остановлен');
+      this.telemetry?.count('drive_listing_pages');this.telemetry?.count('drive_listing_items',result.files.length);
       found.push(...result.files);page=result.nextPageToken||'';
     }while(page);return found;
   }
@@ -152,7 +168,7 @@ export class Drive implements Remote {
         if(Number(f.size)>this.maxBytes)throw new Error('Файл больше лимита 10 МБ: '+path);
         const entry:Entry={path,id:f.id,version:f.version,hash:f.sha256Checksum||''};
         if(!entry.hash){
-          const bytes=await this.download(entry);entry.hash=await hash(bytes);
+          const bytes=await this.download(entry,'index_content_download');entry.hash=await hash(bytes);
           if(this.cachedBytes+bytes.byteLength<=20*1024*1024){this.cache.set(entry.id!+'|'+entry.version,bytes);this.cachedBytes+=bytes.byteLength;}
         }
         this.control.progress?.({phase:'Сканирование Google Drive: найдено '+(++this.scanned),done:0,total:0,path});
@@ -161,11 +177,11 @@ export class Drive implements Remote {
     };
     await walk(this.root,'',0);return output;
   }
-  async download(entry:Entry):Promise<ArrayBuffer> {
+  async download(entry:Entry,purpose='note_download'):Promise<ArrayBuffer> {
     // A strong checksum from the listing proves the bytes match the planned revision.
     // Keep version bracketing only for files without a checksum.
     if(entry.hash){
-      const bytes=(await this.req({url:API+'/'+entry.id+'?alt=media'})).arrayBuffer;
+      const bytes=(await this.req({url:API+'/'+entry.id+'?alt=media'},purpose)).arrayBuffer;
       if(bytes.byteLength>this.maxBytes)throw new Error('Файл превышает лимит');
       if(await hash(bytes)!==entry.hash)throw new Error('Контрольная сумма Drive изменилась: '+entry.path);
       return bytes;
@@ -173,13 +189,13 @@ export class Drive implements Remote {
     const before=(await this.meta(entry.id!)).json as FileMeta;
     if(before.version!==entry.version||before.trashed)throw new Error('Версия Drive изменилась: '+entry.path);
     if(Number(before.size)>this.maxBytes)throw new Error('Файл превышает лимит');
-    const bytes=(await this.req({url:API+'/'+entry.id+'?alt=media'})).arrayBuffer;
+    const bytes=(await this.req({url:API+'/'+entry.id+'?alt=media'},purpose)).arrayBuffer;
     if(bytes.byteLength>this.maxBytes)throw new Error('Файл превышает лимит');
     const after=(await this.meta(entry.id!)).json as FileMeta;
     if(after.version!==entry.version||after.trashed)throw new Error('Drive изменился во время чтения');
     return bytes;
   }
-  async read(entry:Entry){const key=entry.id+'|'+entry.version;const cached=this.cache.get(key);if(cached){this.cache.delete(key);this.cachedBytes-=cached.byteLength;}const bytes=cached||await this.download(entry);if(entry.hash&&await hash(bytes)!==entry.hash)throw new Error('Контрольная сумма Drive изменилась');return bytes;}
+  async read(entry:Entry,purpose='note_download'){const key=entry.id+'|'+entry.version;const cached=this.cache.get(key);if(cached){this.cache.delete(key);this.cachedBytes-=cached.byteLength;this.telemetry?.count('drive_content_cache_hits');}const bytes=cached||await this.download(entry,purpose);if(entry.hash&&await hash(bytes)!==entry.hash)throw new Error('Контрольная сумма Drive изменилась');return bytes;}
   async folder(name:string,parent:string):Promise<string>{
     const key=parent+'/'+name;const pending=this.folderRequests.get(key);if(pending)return pending;
     const request=this.ensureFolder(name,parent);this.folderRequests.set(key,request);
@@ -201,12 +217,12 @@ export class Drive implements Remote {
     const parts=path.split('/').slice(0,-1);let key='',parent=this.root;
     for(const part of parts){key=key?key+'/'+part:part;let id=this.folders.get(key);if(!id){id=await this.folder(part,parent);this.folders.set(key,id);}parent=id;}return parent;
   }
-  async create(name:string,parent:string,bytes:ArrayBuffer,mimeType='application/octet-stream',id?:string,description?:string):Promise<FileMeta>{
+  async create(name:string,parent:string,bytes:ArrayBuffer,mimeType='application/octet-stream',id?:string,description?:string,category='note_upload'):Promise<FileMeta>{
     const boundary='nb_'+crypto.randomUUID();const enc=new TextEncoder();
     const head=enc.encode(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify({name,parents:[parent],mimeType,...(id?{id}:{}),...(description?{description}:{})})}\r\n--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n`);
     const tail=enc.encode(`\r\n--${boundary}--\r\n`);const data=new Uint8Array(head.length+bytes.byteLength+tail.length);
     data.set(head);data.set(new Uint8Array(bytes),head.length);data.set(tail,head.length+bytes.byteLength);
-    const response=await this.req({url:'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields='+fields,method:'POST',contentType:'multipart/related; boundary='+boundary,body:buffer(data)});
+    const response=await this.req({url:'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields='+fields,method:'POST',contentType:'multipart/related; boundary='+boundary,body:buffer(data)},category,bytes.byteLength);
     return response.json as FileMeta;
   }
   async write(path:string,bytes:ArrayBuffer,expected?:Entry):Promise<Entry>{
@@ -240,7 +256,7 @@ export class Drive implements Remote {
       const etag=meta.etag;
       // Never silently fall back to a blind overwrite. Live Drive validation is a release gate.
       if(!etag)throw new Error('Drive не вернул ETag: безопасная перезапись заблокирована');
-      result=(await this.req({url:'https://www.googleapis.com/upload/drive/v2/files/'+expected.id+'?uploadType=media&fields=id,version',method:'PUT',headers:{'If-Match':etag},contentType:'application/octet-stream',body:bytes})).json as FileMeta;
+      result=(await this.req({url:'https://www.googleapis.com/upload/drive/v2/files/'+expected.id+'?uploadType=media&fields=id,version',method:'PUT',headers:{'If-Match':etag},contentType:'application/octet-stream',body:bytes},'note_upload',bytes.byteLength)).json as FileMeta;
     }else{
       const parent=await this.parent(path),name=path.split('/').at(-1)!;
       if((await this.children(parent,name)).some(f=>f.name===name))throw new Error('Файл уже появился в Drive: '+path);
@@ -249,7 +265,7 @@ export class Drive implements Remote {
     }
     const entry={path,id:result.id,version:result.version,hash:checksum};
     if(result.sha256Checksum){if(result.sha256Checksum!==entry.hash)throw new Error('Проверка записи не пройдена');}
-    else {const saved=await this.read(entry);if(await hash(saved)!==entry.hash)throw new Error('Проверка записи не пройдена');}
+    else {const saved=await this.read(entry,'verification_download');if(await hash(saved)!==entry.hash)throw new Error('Проверка записи не пройдена');}
     this.indexEntry(entry);
     return entry;
   }
@@ -309,7 +325,7 @@ export class Drive implements Remote {
     const key='history|'+checksum;let intent=this.hooks?.pending[key];
     if(intent){try{const f=(await this.meta(intent.id)).json as FileMeta;if(!f.trashed&&f.parents?.includes(this.historyId)&&f.sha256Checksum===checksum){await this.hooks!.savedHistory(checksum,{path,id:f.id,version:f.version,hash:checksum});return;}}catch(e){if(!String(e).includes('HTTP 404'))throw e;}}
     if(this.hooks&&!intent){const id=await this.reserveId();if(!id)throw new Error('Drive не вернул ID снимка');intent={id,path,hash:checksum};await this.hooks.intent(key,intent);}
-    const snapshot=await this.create(checksum+'.snapshot',this.historyId,bytes,'application/octet-stream',intent?.id,JSON.stringify({schema:2,time:new Date().toISOString(),path,source,hash:checksum}));
+    const snapshot=await this.create(checksum+'.snapshot',this.historyId,bytes,'application/octet-stream',intent?.id,JSON.stringify({schema:2,time:new Date().toISOString(),path,source,hash:checksum}),'history_upload');
     if(snapshot.sha256Checksum&&snapshot.sha256Checksum!==checksum)throw new Error('Не совпала контрольная сумма снимка');
     if(this.hooks)await this.hooks.savedHistory(checksum,{path,id:snapshot.id,version:snapshot.version,hash:checksum});
   }

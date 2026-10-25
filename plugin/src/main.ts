@@ -1,10 +1,13 @@
 import {Journal} from '../../core/journal';
+import {LocalIndex} from '../../core/local-index';
+import {PerformanceRun,type Outcome} from '../../core/performance';
+import {PerformanceLog} from '../../core/performance-log';
 import {autosyncDelay} from '../../core/scheduling';
 import {mergeVersions} from '../../core/merge';
 import {ResolutionModal,type Review} from './resolution';
 import {under,remapBaseline,duplicateFolders,type Rename} from '../../core/changes';
 import {Paused,type Progress} from '../../core/control';
-import {Plugin,PluginSettingTab,Setting,Notice,Modal,TFile,TFolder,requestUrl,setIcon,type App} from 'obsidian';
+import {Plugin,PluginSettingTab,Setting,Notice,Modal,TFile,TFolder,Platform,requestUrl,setIcon,type App} from 'obsidian';
 import {SyncEngine,hash,validPath,type Baseline,type Event,type Local,type Entry} from '../../core/sync';
 import {Drive,type DriveIndex,type WriteIntent} from './drive';
 import {random,digest} from '../../auth-service/src/crypto';
@@ -12,7 +15,7 @@ import {applyRecord,defaults,type Saved,type StateRecord} from './state';
 class HistoryModal extends Modal {
   constructor(app:App,private events:Event[]){super(app);}
   onOpen(){this.titleEl.setText('Note Bridge — журнал');this.contentEl.createEl('p',{text:'Журнал этого устройства. Снимки файлов сохраняются в служебной папке .note-bridge-history в Google Drive. Автоматический откат пока не реализован.'});
-    new Setting(this.contentEl).addButton(b=>b.setButtonText('Скопировать журнал').onClick(()=>{void navigator.clipboard.writeText(JSON.stringify({version:'0.5.0',events:this.events},null,2)).then(()=>new Notice('Журнал скопирован')).catch(()=>new Notice('Копирование недоступно; используйте экспорт из настроек.'));}));
+    new Setting(this.contentEl).addButton(b=>b.setButtonText('Скопировать журнал').onClick(()=>{void navigator.clipboard.writeText(JSON.stringify({version:'0.6.0',events:this.events},null,2)).then(()=>new Notice('Журнал скопирован')).catch(()=>new Notice('Копирование недоступно; используйте экспорт из настроек.'));}));
     const labels:Record<string,string>={upload:'Отправлено в Google Drive',download:'Скачано на устройство',conflict:'Нужно объединить изменения','local-deletion':'Удалено на телефоне — ожидает решения','remote-deletion':'Удалено в Drive — ожидает решения','duplicate-to-trash':'Дубликат перенесён в корзину',resolved:'Конфликт разрешён','resolution-trash-local':'Файл перенесён в локальную корзину','resolution-trash-remote':'Файл перенесён в корзину Drive',metrics:'Статистика запросов Drive',merged:'Изменения объединены',recovered:'Прерванная операция подтверждена',rename:'Переименовано',complete:'Синхронизация завершена',paused:'Синхронизация приостановлена',error:'Ошибка синхронизации'};
     const list=this.contentEl.createDiv();
     const render=(onlyIssues:boolean)=>{list.empty();const events=this.events.slice(-100).reverse().filter(e=>!onlyIssues||['conflict','local-deletion','remote-deletion','duplicate-to-trash','resolved','merged','error','resolution-trash-local','resolution-trash-remote'].includes(e.action));
@@ -46,14 +49,14 @@ class ProgressModal extends Modal {
 }
 export default class NoteBridge extends Plugin {
   journal!:Journal<Saved,StateRecord>;
+  performanceLog!:PerformanceLog;telemetry?:PerformanceRun;firstSync=true;layoutReady=false;
   state:Saved={settings:{...defaults},baseline:{},events:[]};
   status!:HTMLElement; busy=false; stopped=false; timer:number|undefined; saveQueue:Promise<void>=Promise.resolve();
   progress:Progress={phase:'Готов',done:0,total:0}; listeners=new Set<()=>void>(); paused=false; backgrounded=false; explorerButtons=new Set<HTMLElement>();
   internalPaths=new Map<string,number>();
   reviewing=0;applying=0;dirty=false;ribbon?:HTMLElement;
   lastSync=0;lastEdit=0;
-  cacheEpoch=0;
-  localCache=new Map<string,{mtime:number;size:number;hash:string}>();
+  localCache=new LocalIndex();
   tokenRequest?:Promise<string>;
   access?:{token:string;expires:number}; pending?:{session:string;verifier:string};
   async onload(){
@@ -61,8 +64,10 @@ export default class NoteBridge extends Plugin {
     const dir=this.manifest.dir;if(!dir)throw new Error('Не найден каталог плагина');
     this.journal=new Journal(this.app.vault.adapter,dir+'/state',applyRecord);
     const loaded=await this.journal.load(fallback);
+    this.performanceLog=new PerformanceLog(this.app.vault.adapter,dir+'/state/performance');
     if(!await this.app.vault.adapter.exists(dir+'/state/blobs'))await this.app.vault.adapter.mkdir(dir+'/state/blobs');
     this.state={settings:{...defaults,...loaded?.settings},baseline:loaded?.baseline||{},events:loaded?.events||[],binding:loaded?.binding,resumeSync:loaded?.resumeSync,renames:loaded?.renames||[],autoMigration:true,operations:loaded?.operations||{},pending:loaded?.pending||{},history:loaded?.history||{},noticeKey:loaded?.noticeKey,conflicts:loaded?.conflicts||{},driveIndex:loaded?.driveIndex,deleted:loaded?.deleted||[],lastProgress:loaded?.lastProgress};
+    this.state.localIndex=loaded?.localIndex||{};this.localCache=new LocalIndex(this.state.localIndex);
     if(this.state.lastProgress)this.progress=this.state.lastProgress;
     if(!loaded?.autoMigration)this.state.settings.autoSync=true;
     if(!this.state.settings.secretId)this.state.settings.secretId='note-bridge-'+crypto.randomUUID();
@@ -71,6 +76,7 @@ export default class NoteBridge extends Plugin {
     this.ribbon=this.addRibbonIcon('refresh-cw','Note Bridge: синхронизация и прогресс',()=>this.openProgress());
     const mount=()=>this.mountExplorerButtons();
     this.app.workspace.onLayoutReady(()=>{
+      this.layoutReady=true;
       mount();
       const observer=new MutationObserver(mount);
       observer.observe(this.app.workspace.containerEl,{childList:true,subtree:true});
@@ -81,18 +87,22 @@ export default class NoteBridge extends Plugin {
     this.addCommand({id:'progress',name:'Синхронизация и прогресс',callback:()=>this.openProgress()});
     this.addCommand({id:'sync',name:'Синхронизировать',callback:()=>{void this.sync();}});
     this.addCommand({id:'rebuild-index',name:'Полная перепроверка индекса',callback:()=>{if(this.busy)return;this.state.driveIndex=undefined;this.localCache.clear();void this.sync();}});
+    this.addCommand({id:'verify-local',name:'Полная проверка содержимого локальных файлов',callback:()=>{if(this.busy)return;this.localCache.clear();void this.sync();}});
+    this.addCommand({id:'performance',name:'Показать замеры скорости',callback:()=>{void this.showPerformance();}});
+    this.addCommand({id:'export-performance',name:'Экспортировать технический журнал скорости',callback:()=>{void this.exportPerformance().catch(e=>new Notice(String(e)));}});
     this.addCommand({id:'preview',name:'Предпросмотр синхронизации',callback:()=>{void this.sync(true);}});
     this.addCommand({id:'resolve',name:'Конфликты и удаления',callback:()=>new ResolutionModal(this.app,this).open()});
     this.addCommand({id:'history',name:'Показать журнал',callback:()=>new HistoryModal(this.app,this.state.events).open()});
     this.addSettingTab(new BridgeSettings(this.app,this));
     const schedule=()=>this.schedule();
-    const changed=(file:{path:string})=>{this.cacheEpoch++;this.localCache.delete(file.path);if(this.internalPaths.has(file.path)||!validPath(file.path))return;this.lastEdit=Date.now();this.schedule();};
-    this.registerEvent(this.app.vault.on('modify',changed));this.registerEvent(this.app.vault.on('create',changed));
+    const changed=(file:{path:string})=>{this.localCache.invalidate(file.path);if(this.internalPaths.has(file.path)||!validPath(file.path)||file.path.startsWith('Note Bridge Journal '))return;this.lastEdit=Date.now();this.schedule();};
+    this.registerEvent(this.app.vault.on('modify',changed));this.registerEvent(this.app.vault.on('create',file=>{if(this.layoutReady)changed(file);}));
     this.registerEvent(this.app.vault.on('delete',file=>{
+      this.localCache.invalidateTree(file.path);
       if(!this.internalPaths.has(file.path)){for(const path of Object.keys(this.state.baseline))if(under(path,file.path)&&!this.state.deleted!.includes(path))this.state.deleted!.push(path);void this.persist();}changed(file);
     }));
     this.registerEvent(this.app.vault.on('rename',(file,old)=>{
-      this.localCache.clear();if(this.internalPaths.has(old)||this.internalPaths.has(file.path)||!validPath(old)||!validPath(file.path))return;this.lastEdit=Date.now();
+      this.localCache.invalidateTree(old);this.localCache.invalidateTree(file.path);if(this.internalPaths.has(old)||this.internalPaths.has(file.path)||!validPath(old)||!validPath(file.path))return;this.lastEdit=Date.now();
       const queue=this.state.renames!;const prior=queue.find(r=>r.to===old);
       if(prior)prior.to=file.path;else queue.push({from:old,to:file.path,folder:file instanceof TFolder});
       void this.persist();this.schedule();
@@ -113,9 +123,9 @@ export default class NoteBridge extends Plugin {
   async quiet<T>(paths:string[],fn:()=>Promise<T>):Promise<T>{for(const p of paths)this.internalPaths.set(p,(this.internalPaths.get(p)||0)+1);try{return await fn();}finally{for(const p of paths){const n=this.internalPaths.get(p)!-1;if(n)this.internalPaths.set(p,n);else this.internalPaths.delete(p);}}}
   drive(){
     const drive=new Drive(this.state.settings.folderId,()=>this.token(),requestUrl,10*1024*1024,{check:()=>this.check(),progress:p=>this.setProgress(p)});
-    drive.index=this.state.driveIndex;drive.onUnauthorized=()=>{this.access=undefined;};
-    drive.hooks={pending:this.state.pending!,history:this.state.history!,intent:async(key,value)=>{const record:StateRecord={kind:'intent',key,value};await this.journal.record(record);applyRecord(this.state,record);},savedHistory:async(checksum,entry)=>{const record:StateRecord={kind:'history',hash:checksum,entry};await this.journal.record(record);applyRecord(this.state,record);}};
-    const scan=drive.scan.bind(drive);drive.scan=async()=>{const entries=await scan();this.state.driveIndex=drive.index;await this.persist();return entries;};return drive;
+    drive.index=this.state.driveIndex;drive.onUnauthorized=()=>{this.access=undefined;};drive.telemetry=this.telemetry;
+    drive.hooks={pending:this.state.pending!,history:this.state.history!,intent:async(key,value)=>{const record:StateRecord={kind:'intent',key,value};await this.recordState(record);applyRecord(this.state,record);},savedHistory:async(checksum,entry)=>{const record:StateRecord={kind:'history',hash:checksum,entry};await this.recordState(record);applyRecord(this.state,record);}};
+    const scan=drive.scan.bind(drive);drive.scan=async()=>{const entries=this.telemetry?await this.telemetry.measure('drive_check',scan):await scan();this.telemetry?.count('drive_index_entries',entries.size);this.state.driveIndex=drive.index;await this.persist();return entries;};return drive;
   }
   async exclusive<T>(fn:()=>Promise<T>):Promise<T>{
     if(this.busy)throw new Error('Дождитесь завершения синхронизации или нажмите «Пауза»');
@@ -237,7 +247,33 @@ export default class NoteBridge extends Plugin {
     const path='Note Bridge Journal '+new Date().toISOString().replace(/[:.]/g,'-')+'.json';
     await this.app.vault.create(path,JSON.stringify({version:this.manifest.version,events:this.state.events},null,2));new Notice('Создан '+path);
   }
-  persist(){return this.journal.snapshot(this.state);}
+  persist(){return this.telemetry?this.telemetry.measure('state_snapshot',()=>this.journal.snapshot(this.state)):this.journal.snapshot(this.state);}
+  recordState(record:StateRecord){return this.telemetry?this.telemetry.measure('state_record',()=>this.journal.record(record)):this.journal.record(record);}
+  async exportPerformance(){
+    const data=await this.performanceLog.read(this.telemetry?.runId);
+    const path='Note Bridge Journal Performance '+new Date().toISOString().replace(/[:.]/g,'-')+'.json';
+    await this.app.vault.create(path,JSON.stringify({schema:1,exportedAt:new Date().toISOString(),units:{time:'ms',size:'bytes',speed:'bytes/second'},notes:'Stage and operation durations overlap. activeMs is the union of intervals; totalMs is their sum. Latency percentiles cover up to the last 256 completed attempts. Request bytes exclude HTTP/TLS overhead. Interrupted runs have unknown total duration.',...data},null,2));
+    new Notice('Технический журнал сохранён: '+path);
+  }
+  async showPerformance(){
+    try{
+      const {runs,unreadable}=await this.performanceLog.read(this.telemetry?.runId),modal=new Modal(this.app);modal.titleEl.setText('Note Bridge — скорость синхронизации');
+      modal.contentEl.createEl('p',{text:'Последние 200 циклов. Показатели локальные; названия и содержимое заметок, токены и ID Drive не записываются. Этапы могут перекрываться.'});
+      for(const run of runs.slice(-10).reverse()){
+        const card=modal.contentEl.createDiv({cls:'nb-conflict-card'});card.createEl('strong',{text:new Date(run.startedAt).toLocaleString('ru-RU')+' · '+({success:'Готово',issues:'Есть замечания',paused:'Пауза',error:'Ошибка',interrupted:'Прервано',running:'Выполняется'}[run.outcome])});
+        const seconds=(n:number|null)=>n===null?'неизвестно':(n/1000).toFixed(2)+' с';
+        card.createEl('p',{text:'Весь цикл: '+seconds(run.wallMs)+' · '+run.version+' · '+run.platform});
+        const local=run.metrics.local_check,remote=run.metrics.drive_check;
+        card.createEl('p',{text:`Локально: ${seconds(local?.activeMs??null)} · файлов ${run.counters.local_files||0}, из кэша ${run.counters.local_cache_hits||0}, прочитано ${run.counters.local_hashed||0}${run.rates?.localFilesPerSecond?' · '+run.rates.localFilesPerSecond.toFixed(0)+' файлов/с':''}`});
+        card.createEl('p',{text:`Drive: ${seconds(remote?.activeMs??null)} · страниц изменений ${run.counters.drive_change_pages||0}, страниц папок ${run.counters.drive_listing_pages||0}`});
+        for(const [key,label] of [['note_download','Скачивание содержимого'],['note_upload','Загрузка содержимого'],['history_upload','Запись истории'],['verification_download','Проверочное скачивание']]){const m=run.metrics[key];if(!m)continue;card.createEl('p',{text:`${label}: ${m.completed} успешных запросов, ${m.failed} ошибок · ${(m.successfulBytes/1024).toFixed(1)} КиБ · ${m.bytesPerSecond===null?'—':(m.bytesPerSecond/1024).toFixed(1)+' КиБ/с'} · ${seconds(m.activeMs)}`});}
+        for(const [key,label] of [['operation_upload','Отправка заметок целиком'],['operation_download','Получение заметок целиком']]){const m=run.metrics[key];if(m)card.createEl('p',{text:`${label}: ${m.completed} файлов · ${seconds(m.activeMs)} · ${m.operationsPerSecond===null?'—':m.operationsPerSecond.toFixed(2)+' файлов/с'}`});}
+      }
+      if(!runs.length)modal.contentEl.createEl('p',{text:'Замеры появятся после первой синхронизации.'});
+      if(unreadable)modal.contentEl.createEl('p',{text:'Не удалось прочитать записей: '+unreadable});
+      new Setting(modal.contentEl).addButton(b=>b.setButtonText('Экспортировать JSON').onClick(()=>{void this.exportPerformance().catch(e=>new Notice(String(e)));}));modal.open();
+    }catch(e){new Notice('Не удалось открыть технический журнал: '+String(e));}
+  }
   async cached(checksum:string):Promise<ArrayBuffer|undefined>{
     const path=this.manifest.dir+'/state/blobs/'+checksum;
     if(!await this.app.vault.adapter.exists(path))return;
@@ -290,21 +326,18 @@ export default class NoteBridge extends Plugin {
     };
     const adapter:Local={
       exists:path=>!!vault.getAbstractFileByPath(path),
-      scan:async()=>{const files=new Map<string,Entry>();for(const f of vault.getFiles()){
+      scan:async()=>{let checkedBytes=0;const scan=async()=>{const files=new Map<string,Entry>();for(const f of vault.getFiles()){
         if(checkScan)this.check();
         if(f.path.startsWith('Note Bridge Journal '))continue;
         if(f.path.split('/').some(p=>p.startsWith('.'))||f.path.startsWith('Note Bridge Conflicts/'))continue;
         if(!validPath(f.path))throw new Error('Неподдерживаемый путь: '+f.path);
         if(f.stat.size>10*1024*1024)throw new Error('Файл больше лимита 10 МБ: '+f.path);
-        let cached=this.localCache.get(f.path);
-        if(!cached||cached.mtime!==f.stat.mtime||cached.size!==f.stat.size){
-          const epoch=this.cacheEpoch,mtime=f.stat.mtime,size=f.stat.size,bytes=await vault.readBinary(f),checksum=await hash(bytes);
-          if(this.state.baseline[f.path]?.hash===checksum&&/\.(md|txt)$/i.test(f.path))await this.remember(bytes);
-          if(f.stat.mtime!==mtime||f.stat.size!==size)throw new Error('Файл изменился во время чтения: '+f.path);
-          cached={mtime,size,hash:checksum};if(epoch===this.cacheEpoch)this.localCache.set(f.path,cached);
-        }
-        files.set(f.path,{path:f.path,hash:cached.hash});
-      }return files;},
+        this.telemetry?.count('local_files');
+        const result=await this.localCache.inspect(f.path,()=>({...f.stat}),()=>this.telemetry?this.telemetry.measure('local_content_read',()=>vault.readBinary(f),bytes=>bytes.byteLength):vault.readBinary(f));
+        this.telemetry?.count(result.hit?'local_cache_hits':'local_hashed');this.telemetry?.count('local_reason_'+result.reason);
+        if(result.bytes){checkedBytes+=result.bytes.byteLength;this.telemetry?.count('local_hashed_bytes',result.bytes.byteLength);if(this.state.baseline[f.path]?.hash===result.entry.hash&&/\.(md|txt)$/i.test(f.path))await this.remember(result.bytes);}
+        files.set(f.path,result.entry);
+      }this.localCache.prune(new Set(files.keys()));return files;};return this.telemetry?this.telemetry.measure('local_check',scan,()=>checkedBytes):scan();},
       read:async(path)=>{const f=vault.getAbstractFileByPath(path);if(!(f instanceof TFile))throw new Error('Файл исчез: '+path);return vault.readBinary(f);},
       write:async(path,bytes,expected)=>{
         this.check();
@@ -337,7 +370,9 @@ export default class NoteBridge extends Plugin {
   }
   async sync(dryRun=false,automatic=false){
     if(this.busy||this.stopped||document.hidden||(automatic&&(this.reviewing||!this.state.settings.autoSync||this.paused)))return;if(this.timer)window.clearTimeout(this.timer);this.lastSync=Date.now();this.dirty=false;this.busy=true;this.paused=false;this.backgrounded=false;
+    const run=new PerformanceRun({version:this.manifest.version,platform:Platform.isMobile?'mobile':'desktop',trigger:dryRun?'preview':automatic?'automatic':'manual-or-resume',startup:this.firstSync});this.firstSync=false;this.telemetry=run;let outcome:Outcome='error';
     try{
+      try{await this.performanceLog.save(run.report('running'));}catch{new Notice('Не удалось начать технический журнал скорости');}
       this.state.resumeSync=!dryRun;await this.persist();this.setProgress({phase:'Сверка…',done:0,total:0});
       const binding=this.origin()+'|'+this.state.settings.folderId;
       if(this.state.binding&&this.state.binding!==binding)throw new Error('Папка или сервис изменились. Используйте отдельное тестовое хранилище.');
@@ -347,10 +382,10 @@ export default class NoteBridge extends Plugin {
         this.state.baseline=base;
         const remote=drive.entryForPath(event.path);
         const record:StateRecord={kind:'checkpoint',path:event.path,base:base[event.path]||null,event,remote,conflict:this.state.conflicts?.[event.path],binding};
-        await this.journal.record(record);
+        await this.recordState(record);
         // In-memory index is already current. Replay updates are only needed after restart.
         this.state.binding=binding;this.state.events.push(event);this.state.events=this.state.events.slice(-500);if(!['error','conflict','local-deletion','remote-deletion'].includes(event.action))delete this.state.operations?.[event.path];
-      },{check:()=>this.check(),progress:p=>this.setProgress(p)},{local:new Set(this.state.deleted),remote:drive.deletedIds,conflicts:this.state.conflicts,recover:async(locals,remotes,baseline)=>{
+      },{check:()=>this.check(),progress:p=>this.setProgress(p)},{performance:run,local:new Set(this.state.deleted),remote:drive.deletedIds,conflicts:this.state.conflicts,recover:async(locals,remotes,baseline)=>{
         const recovered:string[]=[];
         for(const [path,op] of Object.entries(this.state.operations||{})){
           const l=locals.get(path),r=remotes.get(path);
@@ -358,8 +393,9 @@ export default class NoteBridge extends Plugin {
           else if(op.action==='download'&&op.remote&&l?.hash===op.remote.hash&&r?.id===op.remote.id){baseline[path]={hash:op.remote.hash,remoteId:op.remote.id};recovered.push(path);}
         }return recovered;
       },cached:h=>this.cached(h),remember:b=>this.remember(b),isolateErrors:true,
-        prepare:async(path,action,l,r)=>{const record:StateRecord={kind:'operation',path,value:{id:crypto.randomUUID(),action,local:l,remote:r,time:Date.now()}};await this.journal.record(record);applyRecord(this.state,record);}});
+        prepare:async(path,action,l,r)=>{const record:StateRecord={kind:'operation',path,value:{id:crypto.randomUUID(),action,local:l,remote:r,time:Date.now()}};await this.recordState(record);applyRecord(this.state,record);}});
       const events=await engine.run(dryRun);
+      for(const event of events)run.count('result_'+event.action);
       if(!dryRun)this.state.events.push({time:new Date().toISOString(),path:'',action:'metrics',detail:JSON.stringify(drive.metrics)});
       this.state.deleted=this.state.deleted?.filter(p=>!!this.state.baseline[p]&&!this.app.vault.getAbstractFileByPath(p));
       for(const [key,intent] of Object.entries(this.state.pending||{}))if(!key.startsWith('history|')&&this.state.baseline[intent.path]?.hash===intent.hash&&this.state.baseline[intent.path]?.remoteId===intent.id)delete this.state.pending![key];
@@ -367,6 +403,7 @@ export default class NoteBridge extends Plugin {
       this.state.resumeSync=false;await this.persist();
       if(!dryRun){const keep=new Set([...Object.values(this.state.baseline).map(b=>b.hash),...Object.values(this.state.pending||{}).map(p=>p.hash)]);for(const path of (await this.app.vault.adapter.list(this.manifest.dir+'/state/blobs')).files)if(!keep.has(path.split('/').at(-1)!))await this.app.vault.adapter.remove(path).catch(()=>{});}
       const pending=events.filter(e=>e.action.includes('deletion')||e.action==='conflict'||e.action==='error').length;
+      outcome=pending?'issues':'success';
       this.setProgress({...this.progress,phase:pending?`Требует внимания: ${pending}`:'Синхронизировано'});
       const noticeKey=events.filter(e=>e.action==='conflict'||e.action==='error'||e.action.includes('deletion')).map(e=>e.path+'|'+e.action+'|'+this.state.conflicts?.[e.path]).sort().join('\n');
       const changedIssues=noticeKey!==this.state.noticeKey;
@@ -375,12 +412,18 @@ export default class NoteBridge extends Plugin {
       else if(!automatic||(pending&&changedIssues))new Notice(pending?`Note Bridge: ${pending} операций требуют внимания: откройте конфликты или журнал`:'Note Bridge: синхронизация завершена');
     }catch(error){
       const suspended=error instanceof Paused||this.backgrounded||document.hidden;
+      outcome=suspended?'paused':'error';
       const message=suspended?'Пауза. Выполненные операции сохранены.':error instanceof Error?error.message:'Неизвестная ошибка';
       this.setProgress({...this.progress,phase:suspended?'Приостановлено':'Ошибка: '+message});
       if(!suspended){this.state.resumeSync=false;new Notice(message,12000);}
       this.state.events.push({time:new Date().toISOString(),path:this.progress.path||'',action:suspended?'paused':'error',detail:message});this.state.events=this.state.events.slice(-500);await this.persist();
     }finally{
-      this.busy=false;this.state.lastProgress=this.progress;await this.persist();this.setProgress(this.progress);
+      this.busy=false;this.state.lastProgress=this.progress;
+      try{await this.persist();}catch(e){outcome='error';throw e;}finally{
+        this.telemetry=undefined;
+        try{await this.performanceLog.save(run.report(outcome));}catch{new Notice('Не удалось сохранить технический журнал скорости');}
+      }
+      this.setProgress(this.progress);
       if(this.dirty)this.schedule();
       if(this.state.resumeSync&&!document.hidden&&!this.paused&&!this.stopped)window.setTimeout(()=>{void this.sync();},500);
     }
@@ -389,7 +432,7 @@ export default class NoteBridge extends Plugin {
 class BridgeSettings extends PluginSettingTab {
   constructor(app:App,private p:NoteBridge){super(app,p);}
   display(){
-    const el=this.containerEl;el.empty();el.createEl('h2',{text:'Note Bridge · тестовая версия 0.5.0'});
+    const el=this.containerEl;el.empty();el.createEl('h2',{text:'Note Bridge · тестовая версия 0.6.0'});
     el.createEl('p',{text:'Используйте отдельную копию хранилища. Локальные удаления передаются автоматически, если версия Drive не менялась; спорные удаления — в «Конфликты и удаления». Лимит файла — 10 МБ. Другие средства синхронизации этого хранилища должны быть отключены.'});
     new Setting(el).setName('Адрес сервиса авторизации').setDesc('https://имя.workers.dev').addText(t=>t.setValue(this.p.state.settings.workerUrl).onChange(async v=>{if(this.p.busy)return;this.p.state.settings.workerUrl=v.trim();this.p.access=undefined;await this.p.persist();}));
     new Setting(el).setName('ID папки Google Drive').setDesc('Часть адреса после /folders/. Папку создайте заранее.').addText(t=>t.setValue(this.p.state.settings.folderId).onChange(async v=>{if(this.p.busy)return;this.p.state.settings.folderId=v.trim();await this.p.persist();}));
@@ -400,6 +443,8 @@ class BridgeSettings extends PluginSettingTab {
     new Setting(el).setName('Конфликты и удаления').addButton(b=>b.setButtonText('Разобрать').onClick(()=>new ResolutionModal(this.app,this.p).open()));
     new Setting(el).setName('Прогресс').addButton(b=>b.setButtonText('Открыть').onClick(()=>this.p.openProgress()));
     new Setting(el).setName('Экспорт журнала').setDesc('Создаёт JSON без токенов и настроек авторизации. Его можно прислать для диагностики.').addButton(b=>b.setButtonText('Экспортировать').onClick(()=>action(()=>this.p.exportJournal())));
+    new Setting(el).setName('Скорость синхронизации').setDesc('Последние 200 циклов: проверка файлов, запросы, передача, ошибки и сохранение состояния.').addButton(b=>b.setButtonText('Посмотреть').onClick(()=>{void this.p.showPerformance();})).addButton(b=>b.setButtonText('Экспортировать замеры').onClick(()=>action(()=>this.p.exportPerformance())));
+    new Setting(el).setName('Проверка локального содержимого').setDesc('При запуске сравниваются размер и даты файлов. Хеши перепроверяются каждые 7 дней; здесь можно принудительно перепроверить все файлы.').addButton(b=>b.setButtonText('Перепроверить').onClick(()=>{if(this.p.busy)return;this.p.localCache.clear();void this.p.sync();}));
     new Setting(el).setName('Синхронизация').addButton(b=>b.setButtonText('Предпросмотр').onClick(()=>action(()=>this.p.sync(true)))).addButton(b=>b.setButtonText('Синхронизировать').setCta().onClick(()=>action(()=>this.p.sync())));
     new Setting(el).setName('Автоматическая синхронизация').setDesc('После 30 секунд без правок, не чаще раза в минуту. Изменения Drive проверяются периодически. iOS может приостановить работу в фоне.').addToggle(t=>t.setValue(this.p.state.settings.autoSync).onChange(async v=>{this.p.state.settings.autoSync=v;await this.p.persist();}));
     new Setting(el).setName('История').addButton(b=>b.setButtonText('Открыть журнал').onClick(()=>new HistoryModal(this.app,this.p.state.events).open()));

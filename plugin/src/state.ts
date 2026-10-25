@@ -2,9 +2,10 @@ import type {Baseline,Entry,Event} from '../../core/sync';
 import type {Progress} from '../../core/control';
 import type {Rename} from '../../core/changes';
 import type {DriveIndex,WriteIntent} from './drive';
+import type {LocalRecord} from '../../core/local-index';
 export type Settings={workerUrl:string;folderId:string;autoSync:boolean;intervalSeconds:number;deviceName:string;secretId:string};
 export type Operation={id:string;action:string;local?:Entry;remote?:Entry;time:number};
-export type Saved={operations?:Record<string,Operation>;pending?:Record<string,WriteIntent>;history?:Record<string,Entry>;noticeKey?:string;conflicts?:Record<string,string>;driveIndex?:DriveIndex;deleted?:string[];lastProgress?:Progress;settings:Settings;baseline:Baseline;events:Event[];binding?:string;resumeSync?:boolean;renames?:(Rename&{id?:string})[];autoMigration?:boolean};
+export type Saved={localIndex?:Record<string,LocalRecord>;operations?:Record<string,Operation>;pending?:Record<string,WriteIntent>;history?:Record<string,Entry>;noticeKey?:string;conflicts?:Record<string,string>;driveIndex?:DriveIndex;deleted?:string[];lastProgress?:Progress;settings:Settings;baseline:Baseline;events:Event[];binding?:string;resumeSync?:boolean;renames?:(Rename&{id?:string})[];autoMigration?:boolean};
 export type StateRecord={kind:'checkpoint';path:string;base:Baseline[string]|null;event:Event;remote?:Entry;conflict?:string;binding:string}|{kind:'intent';key:string;value:WriteIntent|null}|{kind:'history';hash:string;entry:Entry}|{kind:'operation';path:string;value:Operation};
 export function applyRecord(state:Saved,record:StateRecord){
  if(record.kind==='intent'){state.pending||={};if(record.value)state.pending[record.key]=record.value;else delete state.pending[record.key];return;}
