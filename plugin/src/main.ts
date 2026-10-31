@@ -1,3 +1,4 @@
+import {Connection,BrokerError} from '../../core/connection';
 import {BridgeModal} from './modal';
 import {formatDriveMetrics} from '../../core/event-format';
 import {Journal} from '../../core/journal';
@@ -17,7 +18,7 @@ import {applyRecord,defaults,type Saved,type StateRecord} from './state';
 class HistoryModal extends BridgeModal {
   constructor(app:App,private events:Event[]){super(app);}
   onOpen(){this.titleEl.setText('Note Bridge — журнал');this.contentEl.createEl('p',{text:'Журнал этого устройства. Снимки файлов сохраняются в служебной папке .note-bridge-history в Google Drive. Автоматический откат пока не реализован.'});
-    new Setting(this.contentEl).addButton(b=>b.setButtonText('Скопировать журнал').onClick(()=>{void navigator.clipboard.writeText(JSON.stringify({version:'0.6.2',events:this.events},null,2)).then(()=>new Notice('Журнал скопирован')).catch(()=>new Notice('Копирование недоступно; используйте экспорт из настроек.'));}));
+    new Setting(this.contentEl).addButton(b=>b.setButtonText('Скопировать журнал').onClick(()=>{void navigator.clipboard.writeText(JSON.stringify({version:'0.7.0',events:this.events},null,2)).then(()=>new Notice('Журнал скопирован')).catch(()=>new Notice('Копирование недоступно; используйте экспорт из настроек.'));}));
     const labels:Record<string,string>={upload:'Отправлено в Google Drive',download:'Скачано на устройство',conflict:'Нужно объединить изменения','local-deletion':'Удалено на телефоне — ожидает решения','remote-deletion':'Удалено в Drive — ожидает решения','duplicate-to-trash':'Дубликат перенесён в корзину',resolved:'Конфликт разрешён','resolution-trash-local':'Файл перенесён в локальную корзину','resolution-trash-remote':'Файл перенесён в корзину Drive',metrics:'Статистика запросов Drive',merged:'Изменения объединены',recovered:'Прерванная операция подтверждена',rename:'Переименовано',complete:'Синхронизация завершена',paused:'Синхронизация приостановлена',error:'Ошибка синхронизации'};
     const list=this.contentEl.createDiv();
     const render=(onlyIssues:boolean)=>{list.empty();const events=this.events.slice(-100).reverse().filter(e=>!onlyIssues||['conflict','local-deletion','remote-deletion','duplicate-to-trash','resolved','merged','error','resolution-trash-local','resolution-trash-remote'].includes(e.action));
@@ -37,6 +38,7 @@ class ProgressModal extends BridgeModal {
   private render=()=>{
     this.contentEl.empty();const p=this.plugin.progress;
     this.titleEl.setText('Note Bridge');
+    if(this.plugin.connection.status!=='connected'){this.plugin.renderConnection(this.contentEl);return;}
     this.contentEl.createEl('p',{text:p.phase});
     const bar=this.contentEl.createEl('progress',{cls:'nb-progress'});bar.max=Math.max(1,p.total);bar.value=p.done;
     if(!p.total&&this.plugin.busy)bar.removeAttribute('value');
@@ -61,7 +63,8 @@ export default class NoteBridge extends Plugin {
   lastSync=0;lastEdit=0;
   localCache=new LocalIndex();
   tokenRequest?:Promise<string>;
-  access?:{token:string;expires:number}; pending?:{session:string;verifier:string};
+  access?:{token:string;expires:number}; connection!:Connection;
+  authListeners=new Set<()=>void>();
   async onload(){
     const fallback=(await this.loadData()||{settings:{...defaults},baseline:{},events:[]}) as Saved;
     const dir=this.manifest.dir;if(!dir)throw new Error('Не найден каталог плагина');
@@ -75,6 +78,15 @@ export default class NoteBridge extends Plugin {
     if(!loaded?.autoMigration)this.state.settings.autoSync=true;
     if(!this.state.settings.secretId)this.state.settings.secretId='note-bridge-'+crypto.randomUUID();
     await this.persist();
+    const secret=this.state.settings.secretId;
+    this.connection=new Connection({
+      load:()=>{let meta={};try{meta=JSON.parse(this.app.secretStorage?.getSecret(secret+'-connection')||'{}');}catch{}return {...meta,device:this.app.secretStorage?.getSecret(secret)||undefined};},
+      save:data=>{this.app.secretStorage.setSecret(secret,data.device||'');const {device,...meta}=data;this.app.secretStorage.setSecret(secret+'-connection',JSON.stringify(meta));},
+      request:async(path,data,token)=>{const r=await this.broker(path,data,token);return {status:r.status,data:r.json};},
+      changed:()=>{this.access=undefined;if(this.connection?.status!=='connected'&&this.timer)window.clearTimeout(this.timer);this.authListeners.forEach(fn=>fn());this.listeners.forEach(fn=>fn());}
+    });
+    this.registerInterval(window.setInterval(()=>{if(!document.hidden)void this.finishLogin();},3000));
+    this.registerDomEvent(window,'focus',()=>{void this.finishLogin();});
     this.status=this.addStatusBarItem();this.status.setText('Note Bridge: готов');
     this.ribbon=this.addRibbonIcon('refresh-cw','Note Bridge: синхронизация и прогресс',()=>this.openProgress());
     const mount=()=>this.mountExplorerButtons();
@@ -112,13 +124,13 @@ export default class NoteBridge extends Plugin {
     }));
     this.registerDomEvent(document,'visibilitychange',()=>{
       if(document.hidden&&this.busy){this.backgrounded=true;this.setProgress({...this.progress,phase:'Пауза: Obsidian в фоне'});}
-      if(!document.hidden){if(this.state.resumeSync&&!this.busy&&!this.paused)void this.sync();else schedule();}
+      if(!document.hidden){void this.finishLogin();if(this.state.resumeSync&&!this.busy&&!this.paused)void this.sync();else schedule();}
     });
     let last=0;this.registerInterval(window.setInterval(()=>{if(Date.now()-last>=Math.max(60,this.state.settings.intervalSeconds)*1000){last=Date.now();if(!document.hidden)schedule();}},15000));
     this.app.workspace.onLayoutReady(()=>{if(this.state.resumeSync&&!document.hidden)void this.sync();else schedule();});
   }
   schedule(){
-    if(!this.state.settings.autoSync||this.stopped||this.paused||this.reviewing)return;
+    if(this.connection?.status!=='connected'||!this.state.settings.autoSync||this.stopped||this.paused||this.reviewing)return;
     if(this.busy){this.dirty=true;return;}
     if(!this.state.settings.folderId||!this.app.secretStorage?.getSecret(this.state.settings.secretId))return;
     if(this.timer)window.clearTimeout(this.timer);const delay=autosyncDelay(Date.now(),this.lastEdit,this.lastSync);this.timer=window.setTimeout(()=>{void this.sync(false,true);},delay);
@@ -228,7 +240,7 @@ export default class NoteBridge extends Plugin {
       this.telemetry?.count('rename_applied');await this.persist();entries=undefined;
     }
   }
-  onunload(){this.stopped=true;if(this.timer)window.clearTimeout(this.timer);this.access=undefined;this.pending=undefined;}
+  onunload(){this.stopped=true;if(this.timer)window.clearTimeout(this.timer);this.access=undefined;}
   mountExplorerButtons(){
     if(this.stopped)return;
     for(const button of this.explorerButtons)if(!button.isConnected)this.explorerButtons.delete(button);
@@ -300,33 +312,53 @@ export default class NoteBridge extends Plugin {
   origin(){const u=new URL(this.state.settings.workerUrl);if(u.protocol!=='https:'||u.username||u.password||u.pathname!=='/'||u.search||u.hash)throw new Error('Укажите HTTPS-адрес Worker без пути');return u.origin;}
   async broker(path:string,data?:Record<string,string>,token?:string){
     const r=await requestUrl({url:this.origin()+path,method:'POST',contentType:'application/json',body:JSON.stringify(data||{}),headers:token?{Authorization:'Bearer '+token}:{},throw:false});
-    if(r.status>=400)throw new Error(typeof r.json?.error==='string'?r.json.error:'Ошибка авторизации '+r.status);return r;
+    if(r.status>=400)throw new BrokerError(r.status,typeof r.json?.error==='string'?r.json.error:'Ошибка авторизации '+r.status);return r;
+  }
+  renderConnection(el:HTMLElement){
+    const state=this.connection.status;
+    el.createEl('p',{text:this.connection.message||(state==='expired'?'Сессия Google истекла. Подключитесь заново.':state==='connected'?'Google Drive подключён':'Google Drive не подключён')});
+    const action=(fn:()=>Promise<unknown>)=>{void fn().catch(e=>new Notice(e instanceof Error?e.message:'Ошибка подключения'));};
+    if(state==='authorizing'){
+      const indicator=el.createEl('progress',{cls:'nb-progress'});indicator.removeAttribute('value');indicator.setAttribute('aria-label','Ожидание авторизации Google');
+      new Setting(el).setName('Ожидание входа через Google').setDesc('После входа вернитесь в Obsidian — подключение завершится автоматически.').addButton(b=>b.setButtonText('Отменить').onClick(()=>this.connection.cancel()));
+    }else if(state==='connected'){
+      new Setting(el).setName('Google Drive подключён').addButton(b=>b.setButtonText('Выйти из аккаунта').onClick(()=>{
+        const modal=new BridgeModal(this.app);modal.titleEl.setText('Выйти из аккаунта?');
+        modal.contentEl.createEl('p',{text:'Отключится только это устройство. Локальные заметки, файлы Google Drive и история синхронизации не удаляются.'});
+        new Setting(modal.contentEl).addButton(b=>b.setButtonText('Отмена').onClick(()=>modal.close())).addButton(b=>b.setButtonText('Выйти').setWarning().onClick(()=>{modal.close();action(()=>this.disconnect());}));modal.open();
+      }));
+    }else{
+      let code='';
+      new Setting(el).setName('Код подключения').setDesc('Код владельца сервиса авторизации. Не сохраняется.').addText(t=>{t.inputEl.type='password';t.onChange(v=>code=v);});
+      new Setting(el).addButton(b=>b.setButtonText(state==='expired'?'Подключиться заново':'Подключиться').setCta().setDisabled(this.connection.working).onClick(()=>action(()=>this.connect(code))));
+      if(state==='expired')new Setting(el).setName('Удалить истёкшее подключение с устройства').setDesc('Заметки и история сохранятся.').addButton(b=>b.setButtonText('Выйти из аккаунта').onClick(()=>{
+        const modal=new BridgeModal(this.app);modal.titleEl.setText('Выйти из аккаунта?');modal.contentEl.createEl('p',{text:'Данные входа будут удалены с этого устройства. Заметки, история и настройки папки сохранятся.'});
+        new Setting(modal.contentEl).addButton(b=>b.setButtonText('Отмена').onClick(()=>modal.close())).addButton(b=>b.setButtonText('Выйти').setWarning().onClick(()=>{modal.close();action(()=>this.disconnect());}));modal.open();
+      }));
+    }
   }
   async connect(pairingCode:string){
     if(this.busy)throw new Error('Дождитесь завершения синхронизации');
     if(!this.app.secretStorage)throw new Error('Обновите Obsidian: требуется SecretStorage');
-    const verifier=random();const r=await this.broker('/start',{pairingCode,challenge:await digest(verifier)});
-    const target=new URL(r.json.url);if(target.origin!==this.origin()||target.pathname!=='/authorize')throw new Error('Неверный адрес авторизации');
-    this.pending={session:r.json.session,verifier};window.open(target.href);
-    new Notice('Разрешите доступ в браузере, затем нажмите «Завершить подключение».');
+    const verifier=random(),url=await this.connection.start(pairingCode,this.origin(),verifier,await digest(verifier));
+    if(url){window.open(url);new Notice('Завершите вход в браузере и вернитесь в Obsidian.');}
   }
-  async claim(){
-    if(!this.pending)throw new Error('Сначала начните подключение. После перезапуска его нужно начать заново.');
-    const r=await this.broker('/claim',this.pending);if(r.status===202)throw new Error('Вход в браузере ещё не завершён');
-    this.app.secretStorage.setSecret(this.state.settings.secretId,r.json.deviceToken);this.pending=undefined;this.access=undefined;new Notice('Google Drive подключён');
+  async finishLogin(){
+    if(this.stopped||document.hidden||this.connection?.status!=='authorizing')return;
+    try{if(await this.connection.poll(this.origin())){
+      this.paused=false;new Notice('Google Drive подключён');this.schedule();
+    }}catch{/* Invalid service settings must not break focus handlers. */}
   }
   async disconnect(){
-    if(this.busy)throw new Error('Дождитесь синхронизации');
-    const token=this.app.secretStorage?.getSecret(this.state.settings.secretId);
-    if(token)await this.broker('/disconnect',{},token);
-    this.app.secretStorage?.setSecret(this.state.settings.secretId,'');this.access=undefined;this.state.settings.autoSync=false;await this.persist();new Notice('Устройство отключено');
+    if(this.busy)throw new Error('Дождитесь завершения синхронизации');
+    this.access=undefined;this.state.resumeSync=false;
+    await this.connection.logout();await this.persist();new Notice(this.connection.message);
   }
   async token(){
     if(this.access&&this.access.expires>Date.now()+60000)return this.access.token;
     if(this.tokenRequest)return this.tokenRequest;
     this.tokenRequest=(async()=>{
-      const device=this.app.secretStorage?.getSecret(this.state.settings.secretId);if(!device)throw new Error('Сначала подключите Google Drive');
-      const r=await this.broker('/token',{},device);this.access={token:r.json.accessToken,expires:Date.now()+r.json.expiresIn*1000};return this.access.token;
+      const data=await this.connection.token();this.access={token:data.accessToken,expires:Date.now()+data.expiresIn*1000};return this.access.token;
     })();
     try{return await this.tokenRequest;}finally{this.tokenRequest=undefined;}
   }
@@ -382,6 +414,7 @@ export default class NoteBridge extends Plugin {
     return {...adapter,write:(...args)=>this.quiet([args[0]],()=>adapter.write(...args)),move:(...args)=>this.quiet([args[0],args[1]],()=>adapter.move!(...args)),trash:(...args)=>this.quiet([args[0]],()=>adapter.trash!(...args)),conflict:(...args)=>adapter.conflict(...args)};
   }
   async sync(dryRun=false,automatic=false){
+    if(this.connection.status!=='connected'){if(!automatic)this.openProgress();return;}
     if(this.busy||this.stopped||document.hidden||(automatic&&(this.reviewing||!this.state.settings.autoSync||this.paused)))return;if(this.timer)window.clearTimeout(this.timer);this.lastSync=Date.now();this.dirty=false;this.busy=true;this.paused=false;this.backgrounded=false;
     const run=new PerformanceRun({version:this.manifest.version,platform:Platform.isMobile?'mobile':'desktop',trigger:dryRun?'preview':automatic?'automatic':'manual-or-resume',startup:this.firstSync});this.firstSync=false;this.telemetry=run;let outcome:Outcome='error';
     try{
@@ -443,16 +476,17 @@ export default class NoteBridge extends Plugin {
   }
 }
 class BridgeSettings extends PluginSettingTab {
+  private refresh=()=>this.display();
+  hide(){this.p.authListeners.delete(this.refresh);}
   constructor(app:App,private p:NoteBridge){super(app,p);}
   display(){
-    const el=this.containerEl;el.empty();el.createEl('h2',{text:'Note Bridge · тестовая версия 0.6.2'});
+    this.p.authListeners.add(this.refresh);
+    const el=this.containerEl;el.empty();el.createEl('h2',{text:'Note Bridge · тестовая версия 0.7.0'});
     el.createEl('p',{text:'Используйте отдельную копию хранилища. Локальные удаления передаются автоматически, если версия Drive не менялась; спорные удаления — в «Конфликты и удаления». Лимит файла — 10 МБ. Другие средства синхронизации этого хранилища должны быть отключены.'});
     new Setting(el).setName('Адрес сервиса авторизации').setDesc('https://имя.workers.dev').addText(t=>t.setValue(this.p.state.settings.workerUrl).onChange(async v=>{if(this.p.busy)return;this.p.state.settings.workerUrl=v.trim();this.p.access=undefined;await this.p.persist();}));
     new Setting(el).setName('ID папки Google Drive').setDesc('Часть адреса после /folders/. Папку создайте заранее.').addText(t=>t.setValue(this.p.state.settings.folderId).onChange(async v=>{if(this.p.busy)return;this.p.state.settings.folderId=v.trim();await this.p.persist();}));
-    let pairing='';
-    new Setting(el).setName('Код подключения').setDesc('Код владельца сервиса. Используется один раз, не сохраняется в настройках.').addText(t=>{t.inputEl.type='password';t.onChange(v=>{pairing=v;});});
     const action=(fn:()=>Promise<unknown>)=>{void fn().catch(e=>new Notice(e instanceof Error?e.message:'Ошибка',12000));};
-    new Setting(el).setName('Вход через Google').addButton(b=>b.setButtonText('Подключить').onClick(()=>action(()=>this.p.connect(pairing)))).addButton(b=>b.setButtonText('Завершить подключение').onClick(()=>action(()=>this.p.claim())));
+    this.p.renderConnection(el);
     new Setting(el).setName('Конфликты и удаления').addButton(b=>b.setButtonText('Разобрать').onClick(()=>new ResolutionModal(this.app,this.p).open()));
     new Setting(el).setName('Прогресс').addButton(b=>b.setButtonText('Открыть').onClick(()=>this.p.openProgress()));
     new Setting(el).setName('Экспорт журнала').setDesc('Создаёт JSON без токенов и настроек авторизации. Его можно прислать для диагностики.').addButton(b=>b.setButtonText('Экспортировать').onClick(()=>action(()=>this.p.exportJournal())));
@@ -461,6 +495,6 @@ class BridgeSettings extends PluginSettingTab {
     new Setting(el).setName('Синхронизация').addButton(b=>b.setButtonText('Предпросмотр').onClick(()=>action(()=>this.p.sync(true)))).addButton(b=>b.setButtonText('Синхронизировать').setCta().onClick(()=>action(()=>this.p.sync())));
     new Setting(el).setName('Автоматическая синхронизация').setDesc('После 30 секунд без правок, не чаще раза в минуту. Изменения Drive проверяются периодически. iOS может приостановить работу в фоне.').addToggle(t=>t.setValue(this.p.state.settings.autoSync).onChange(async v=>{this.p.state.settings.autoSync=v;await this.p.persist();}));
     new Setting(el).setName('История').addButton(b=>b.setButtonText('Открыть журнал').onClick(()=>new HistoryModal(this.app,this.p.state.events).open()));
-    new Setting(el).setName('Отключить устройство').addButton(b=>b.setButtonText('Отключить').onClick(()=>action(()=>this.p.disconnect())));
+
   }
 }
