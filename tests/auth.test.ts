@@ -45,3 +45,25 @@ test('wrong Google account is denied and session destroyed',async t=>{
  const response=await worker.fetch(new Request('https://auth.example.com/callback?state='+start.session+'&code=code',{headers:{Cookie:'nb_state='+start.session}}),env);
  assert.equal(response.status,403);assert.equal(db.prepare('SELECT count(*) AS n FROM sessions').get()!.n,0);
 });
+test('multi-account callback admits owner and spouse only, with independent devices',async t=>{
+ const {env,db,post}=fixture();env.ALLOWED_EMAIL=' OWNER@example.com, wife@example.com ';
+ let email='owner@example.com',verified=true;
+ t.mock.method(globalThis,'fetch',async(input:string|URL|Request)=>new Response(JSON.stringify(String(input).includes('userinfo')?{email,email_verified:verified}:{access_token:'access',refresh_token:'refresh-'+email,expires_in:3600,scope:'https://www.googleapis.com/auth/drive'})));
+ const grants:string[]=[];
+ for(const [address,confirmed,status] of [['owner@example.com',true,200],['WIFE@example.com',true,200],['stranger@example.com',true,403],['wife@example.com',false,403]] as const){
+   email=address;verified=confirmed;
+   const verifier=random();const start=await (await post('/start',{pairingCode:env.PAIRING_CODE,challenge:await digest(verifier)})).json() as {session:string};
+   const r=await worker.fetch(new Request('https://auth.example.com/callback?state='+start.session+'&code=code',{headers:{Cookie:'nb_state='+start.session}}),env);
+   assert.equal(r.status,status,address);
+   if(status===200){const grant=await (await post('/claim',{session:start.session,verifier})).json() as {deviceToken:string};grants.push(grant.deviceToken);}
+   else assert.equal((await post('/claim',{session:start.session,verifier})).status,410);
+ }
+ assert.equal(new Set(grants).size,2);assert.equal(db.prepare('SELECT count(*) AS n FROM devices').get()!.n,2);
+ await post('/disconnect',{},grants[0]);assert.equal(db.prepare('SELECT count(*) AS n FROM devices').get()!.n,1);
+});
+test('invalid email list blocks start without exposing addresses',async()=>{
+ const {env,post}=fixture();env.ALLOWED_EMAIL='owner@example.com,invalid';
+ assert.equal((await post('/start',{pairingCode:env.PAIRING_CODE,challenge:random()})).status,503);
+ const health=await worker.fetch(new Request('https://auth.example.com/health'),env);
+ assert.deepEqual(await health.json(),{service:'note-bridge-auth',version:'0.1.1',configured:false});
+});

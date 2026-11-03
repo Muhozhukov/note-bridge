@@ -1,4 +1,5 @@
 import {random,digest,equal,seal,unseal} from './crypto';
+import {allowedEmails,permittedEmail} from './allowlist';
 type Session={id:string;challenge:string;google_verifier:string;expires:number;status:string;encrypted_refresh:string|null};
 type Device={token_hash:string;encrypted_refresh:string;expires:number};
 const SCOPES='openid email https://www.googleapis.com/auth/drive';
@@ -24,12 +25,12 @@ async function googleToken(env:Env,values:Record<string,string>):Promise<{access
   const result=await response.json() as {access_token:string;expires_in:number;refresh_token?:string;scope?:string};
   if(!result.access_token||!result.expires_in)throw new HttpError(502,'Invalid Google response');return result;
 }
-function configured(env:Env){return !!(env.DB&&env.GOOGLE_CLIENT_ID&&env.GOOGLE_CLIENT_SECRET&&env.ALLOWED_EMAIL&&env.PAIRING_CODE?.length>=32&&env.TOKEN_ENCRYPTION_KEY&&env.PUBLIC_ORIGIN&&!env.PUBLIC_ORIGIN.includes('REPLACE'));}
+function configured(env:Env){return !!(env.DB&&env.GOOGLE_CLIENT_ID&&env.GOOGLE_CLIENT_SECRET&&allowedEmails(env.ALLOWED_EMAIL).length&&env.PAIRING_CODE?.length>=32&&env.TOKEN_ENCRYPTION_KEY&&env.PUBLIC_ORIGIN&&!env.PUBLIC_ORIGIN.includes('REPLACE'));}
 export default {
   async fetch(request:Request,env:Env):Promise<Response> {
     try {
       const url=new URL(request.url), now=Date.now();
-      if(url.pathname==='/health')return json({service:'note-bridge-auth',version:'0.1.0',configured:configured(env)});
+      if(url.pathname==='/health')return json({service:'note-bridge-auth',version:'0.1.1',configured:configured(env)});
       if(!configured(env))throw new HttpError(503,'OAuth setup is not complete');
       if(url.origin!==env.PUBLIC_ORIGIN||url.protocol!=='https:')throw new HttpError(400,'Invalid service origin');
       if(request.method==='POST'&&url.pathname==='/start') {
@@ -65,7 +66,7 @@ export default {
           const info=await fetch('https://openidconnect.googleapis.com/v1/userinfo',{headers:{Authorization:'Bearer '+token.access_token},signal:AbortSignal.timeout(20000)});
           if(!info.ok)throw new HttpError(403,'Cannot verify Google identity');
           const user=await info.json() as {email?:string;email_verified?:boolean};
-          if(!user.email_verified||!await equal((user.email||'').toLowerCase(),env.ALLOWED_EMAIL.toLowerCase()))throw new HttpError(403,'This account is not allowed');
+          if(!await permittedEmail(env.ALLOWED_EMAIL,user.email,user.email_verified))throw new HttpError(403,'This account is not allowed');
           await env.DB.prepare("UPDATE sessions SET status='ready', encrypted_refresh=?, google_verifier='' WHERE id=?").bind(await seal(token.refresh_token,env.TOKEN_ENCRYPTION_KEY),state).run();
           return text('Google Drive подключён. Вернитесь в Obsidian и нажмите «Завершить подключение». Окно можно закрыть.');
         } catch(error) {await env.DB.prepare('DELETE FROM sessions WHERE id=?').bind(state).run();throw error;}
